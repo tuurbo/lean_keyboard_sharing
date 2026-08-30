@@ -1,6 +1,6 @@
-// Linux sender for keyboard/mouse switcher
-// Captures keyboard and mouse input via evdev, sends to receiver via UDP
-// Compile: g++ -o sender_linux sender_linux.cpp -lX11 -lpthread
+// Linux sender for the keyboard-only switcher.
+// Captures keyboard input through evdev and sends it to the receiver over UDP.
+// Compile: g++ -O3 -o sender_linux sender_linux.cpp -lpthread
 
 #include <cstdint>
 #include <cstring>
@@ -23,30 +23,11 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <linux/input.h>
-#include <X11/Xlib.h>
-#include <X11/extensions/XInput2.h>
+
+#include "keyboard_protocol.h"
 
 // ------------------------- config -------------------------
 static constexpr int PORT = 7777;
-
-// ------------------------- protocol (matches Windows) -----
-struct InputPacket
-{
-    enum Type : uint8_t
-    {
-        MOUSE_MOVE = 0,
-        MOUSE_BUTTON = 1,
-        KEYBOARD = 2,
-        MOUSE_WHEEL = 3
-    } type;
-    union
-    {
-        struct { int x, y; } mouse_move;           // relative dx,dy
-        struct { uint8_t button; bool down; } mouse_button; // 0=L,1=R,2=M
-        struct { uint16_t vkCode; bool down; } keyboard;    // Windows virtual key code
-        struct { int delta; } mouse_wheel;         // +120/-120
-    } data;
-};
 
 // Linux evdev keycode to Windows virtual key mapping
 static uint16_t LinuxToWindowsVK(int linuxCode)
@@ -205,11 +186,6 @@ static sockaddr_in g_recvAddr{};
 
 // evdev device file descriptors
 static std::vector<int> g_keyboardFds;
-static std::vector<int> g_mouseFds;
-
-// X11 for cursor grabbing
-static Display* g_display = nullptr;
-static Window g_rootWindow = 0;
 
 // ------------------------- signal handler -----------------
 static void SignalHandler(int)
@@ -218,7 +194,7 @@ static void SignalHandler(int)
 }
 
 // ------------------------- net ----------------------------
-static inline void SendPacket(const InputPacket &p)
+static inline void SendPacket(const KeyboardPacket &p)
 {
     sendto(g_sock, reinterpret_cast<const char *>(&p), sizeof(p), 0,
            reinterpret_cast<const sockaddr *>(&g_recvAddr), sizeof(g_recvAddr));
@@ -335,49 +311,10 @@ static bool IsHotkeyPressed(int keycode)
     return true;
 }
 
-// ------------------------- X11 cursor grab ----------------
-static bool GrabInput()
-{
-    if (!g_display) return false;
-
-    // Grab both pointer and keyboard via X11
-    int result = XGrabPointer(g_display, g_rootWindow, True,
-                              ButtonPressMask | ButtonReleaseMask | PointerMotionMask,
-                              GrabModeAsync, GrabModeAsync,
-                              g_rootWindow, None, CurrentTime);
-    if (result != GrabSuccess) {
-        std::cerr << "Failed to grab pointer\n";
-        return false;
-    }
-
-    result = XGrabKeyboard(g_display, g_rootWindow, True,
-                           GrabModeAsync, GrabModeAsync, CurrentTime);
-    if (result != GrabSuccess) {
-        XUngrabPointer(g_display, CurrentTime);
-        std::cerr << "Failed to grab keyboard\n";
-        return false;
-    }
-
-    XFlush(g_display);
-    return true;
-}
-
-static void UngrabInput()
-{
-    if (!g_display) return;
-
-    XUngrabPointer(g_display, CurrentTime);
-    XUngrabKeyboard(g_display, CurrentTime);
-    XFlush(g_display);
-}
-
-// Alternative: Use evdev exclusive grab (more reliable, works without X)
+// Exclusively grab only the keyboard devices. Mouse devices are never opened.
 static void GrabEvdevDevices(bool grab)
 {
     for (int fd : g_keyboardFds) {
-        ioctl(fd, EVIOCGRAB, grab ? 1 : 0);
-    }
-    for (int fd : g_mouseFds) {
         ioctl(fd, EVIOCGRAB, grab ? 1 : 0);
     }
 }
@@ -390,13 +327,7 @@ static void StartCapture()
     // Grab evdev devices exclusively to block local input
     GrabEvdevDevices(true);
 
-    // Also try X11 grab for visual cursor confinement
-    GrabInput();
-
-    // Send key-up for modifiers to prevent them getting stuck
-    // (on the sender side, to reset local state)
-
-    std::cout << "capture: ON (local input is blocked)\n";
+    std::cout << "capture: ON (local keyboard is blocked; mouse remains local)\n";
 }
 
 static void StopCapture()
@@ -405,26 +336,23 @@ static void StopCapture()
 
     // Send key-up events for modifiers to the receiver
     if (is_ctrl_pressed.load()) {
-        InputPacket p{};
-        p.type = InputPacket::KEYBOARD;
-        p.data.keyboard.vkCode = 0x11; // VK_CONTROL
-        p.data.keyboard.down = false;
+        KeyboardPacket p{};
+        p.vkCode = 0x11; // VK_CONTROL
+        p.down = 0;
         SendPacket(p);
         is_ctrl_pressed = false;
     }
     if (is_shift_pressed.load()) {
-        InputPacket p{};
-        p.type = InputPacket::KEYBOARD;
-        p.data.keyboard.vkCode = 0x10; // VK_SHIFT
-        p.data.keyboard.down = false;
+        KeyboardPacket p{};
+        p.vkCode = 0x10; // VK_SHIFT
+        p.down = 0;
         SendPacket(p);
         is_shift_pressed = false;
     }
     if (is_alt_pressed.load()) {
-        InputPacket p{};
-        p.type = InputPacket::KEYBOARD;
-        p.data.keyboard.vkCode = 0x12; // VK_MENU (ALT)
-        p.data.keyboard.down = false;
+        KeyboardPacket p{};
+        p.vkCode = 0x12; // VK_MENU (ALT)
+        p.down = 0;
         SendPacket(p);
         is_alt_pressed = false;
     }
@@ -432,14 +360,11 @@ static void StopCapture()
     // Release evdev exclusive grab
     GrabEvdevDevices(false);
 
-    // Release X11 grab
-    UngrabInput();
-
-    std::cout << "capture: OFF (local input restored)\n";
+    std::cout << "capture: OFF (local keyboard restored)\n";
 }
 
 // ------------------------- device discovery ---------------
-static bool IsInputDevice(const std::string& path, bool keyboard)
+static bool IsKeyboardDevice(const std::string& path)
 {
     int fd = open(path.c_str(), O_RDONLY | O_NONBLOCK);
     if (fd < 0) return false;
@@ -450,29 +375,20 @@ static bool IsInputDevice(const std::string& path, bool keyboard)
         return false;
     }
 
-    bool result = false;
-    if (keyboard) {
-        // Check for key events
-        result = (evbit & (1 << EV_KEY)) != 0;
+    bool result = (evbit & (1 << EV_KEY)) != 0;
 
-        // Verify it has actual keyboard keys
-        if (result) {
-            unsigned char keybit[KEY_CNT / 8 + 1] = {0};
-            if (ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(keybit)), keybit) >= 0) {
-                // Check if it has letter keys (A-Z)
-                result = (keybit[KEY_A / 8] & (1 << (KEY_A % 8))) != 0;
-            }
+    if (result) {
+        unsigned char keybit[KEY_CNT / 8 + 1] = {0};
+        if (ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(keybit)), keybit) >= 0) {
+            result = (keybit[KEY_A / 8] & (1 << (KEY_A % 8))) != 0;
         }
-    } else {
-        // Check for relative motion (mouse)
-        result = (evbit & (1 << EV_REL)) != 0;
     }
 
     close(fd);
     return result;
 }
 
-static std::vector<std::string> FindInputDevices(bool keyboard)
+static std::vector<std::string> FindKeyboardDevices()
 {
     std::vector<std::string> devices;
     DIR* dir = opendir("/dev/input");
@@ -483,7 +399,7 @@ static std::vector<std::string> FindInputDevices(bool keyboard)
         std::string name = entry->d_name;
         if (name.find("event") == 0) {
             std::string path = "/dev/input/" + name;
-            if (IsInputDevice(path, keyboard)) {
+            if (IsKeyboardDevice(path)) {
                 devices.push_back(path);
             }
         }
@@ -521,123 +437,17 @@ static void ProcessKeyboardEvent(const input_event& ev, bool& hotkey_triggered)
     // Only forward if capturing and it's a press or release (not repeat)
     if (!g_capturing.load() || !is_press_or_release) return;
 
-    InputPacket p{};
-    p.type = InputPacket::KEYBOARD;
-    p.data.keyboard.vkCode = LinuxToWindowsVK(code);
-    p.data.keyboard.down = down;
+    KeyboardPacket p{};
+    p.vkCode = LinuxToWindowsVK(code);
+    p.down = down ? 1 : 0;
     SendPacket(p);
-}
-
-static void ProcessMouseEvent(const input_event& ev)
-{
-    if (!g_capturing.load()) return;
-
-    if (ev.type == EV_REL) {
-        // Relative motion
-        static int accum_x = 0, accum_y = 0;
-
-        if (ev.code == REL_X) {
-            accum_x += ev.value;
-        } else if (ev.code == REL_Y) {
-            accum_y += ev.value;
-        } else if (ev.code == REL_WHEEL) {
-            InputPacket p{};
-            p.type = InputPacket::MOUSE_WHEEL;
-            p.data.mouse_wheel.delta = ev.value * 120;  // Convert to Windows delta
-            SendPacket(p);
-        } else if (ev.code == REL_HWHEEL) {
-            // Horizontal scroll - not handled by Windows receiver currently
-        }
-
-        // Send accumulated motion on SYN event
-        if (ev.type == EV_SYN && ev.code == SYN_REPORT) {
-            if (accum_x != 0 || accum_y != 0) {
-                InputPacket p{};
-                p.type = InputPacket::MOUSE_MOVE;
-                p.data.mouse_move.x = accum_x;
-                p.data.mouse_move.y = accum_y;
-                SendPacket(p);
-                accum_x = accum_y = 0;
-            }
-        }
-    } else if (ev.type == EV_KEY) {
-        // Mouse buttons
-        bool down = (ev.value == 1);
-        bool is_press_or_release = (ev.value == 0 || ev.value == 1);
-        if (!is_press_or_release) return;
-
-        int button = -1;
-        if (ev.code == BTN_LEFT) button = 0;
-        else if (ev.code == BTN_RIGHT) button = 1;
-        else if (ev.code == BTN_MIDDLE) button = 2;
-        else if (ev.code == BTN_SIDE) button = 3;
-        else if (ev.code == BTN_EXTRA) button = 4;
-
-        if (button >= 0) {
-            InputPacket p{};
-            p.type = InputPacket::MOUSE_BUTTON;
-            p.data.mouse_button.button = button;
-            p.data.mouse_button.down = down;
-            SendPacket(p);
-        }
-    } else if (ev.type == EV_SYN && ev.code == SYN_REPORT) {
-        // Check for accumulated motion (from EV_REL handling above)
-        // This is handled inline in EV_REL block
-    }
-}
-
-// Accumulated mouse motion (must be at file scope for proper SYN handling)
-static int g_accum_x = 0, g_accum_y = 0;
-
-static void ProcessMouseEventWithAccum(const input_event& ev)
-{
-    if (ev.type == EV_REL) {
-        if (ev.code == REL_X) {
-            g_accum_x += ev.value;
-        } else if (ev.code == REL_Y) {
-            g_accum_y += ev.value;
-        } else if (ev.code == REL_WHEEL && g_capturing.load()) {
-            InputPacket p{};
-            p.type = InputPacket::MOUSE_WHEEL;
-            p.data.mouse_wheel.delta = ev.value * 120;
-            SendPacket(p);
-        }
-    } else if (ev.type == EV_KEY && g_capturing.load()) {
-        bool down = (ev.value == 1);
-        bool is_press_or_release = (ev.value == 0 || ev.value == 1);
-        if (!is_press_or_release) return;
-
-        int button = -1;
-        if (ev.code == BTN_LEFT) button = 0;
-        else if (ev.code == BTN_RIGHT) button = 1;
-        else if (ev.code == BTN_MIDDLE) button = 2;
-        else if (ev.code == BTN_SIDE) button = 3;
-        else if (ev.code == BTN_EXTRA) button = 4;
-
-        if (button >= 0) {
-            InputPacket p{};
-            p.type = InputPacket::MOUSE_BUTTON;
-            p.data.mouse_button.button = button;
-            p.data.mouse_button.down = down;
-            SendPacket(p);
-        }
-    } else if (ev.type == EV_SYN && ev.code == SYN_REPORT) {
-        if (g_capturing.load() && (g_accum_x != 0 || g_accum_y != 0)) {
-            InputPacket p{};
-            p.type = InputPacket::MOUSE_MOVE;
-            p.data.mouse_move.x = g_accum_x;
-            p.data.mouse_move.y = g_accum_y;
-            SendPacket(p);
-        }
-        g_accum_x = g_accum_y = 0;
-    }
 }
 
 // ------------------------- main ---------------------------
 int main(int argc, char* argv[])
 {
     if (argc < 2) {
-        std::cout << "usage: sender_linux <receiver_ip> [--hotkey=ALT+C]\n"
+        std::cout << "usage: sender_linux <receiver_ip> [--hotkey=ALT+1]\n"
                      "example: ./sender_linux 192.168.1.100\n"
                      "         ./sender_linux 192.168.1.100 --hotkey=ALT+1\n"
                      "         ./sender_linux 192.168.1.100 --hotkey=CTRL+SHIFT+K\n\n"
@@ -649,8 +459,8 @@ int main(int argc, char* argv[])
 
     // Set default hotkey
     g_hotkey.alt = true;
-    g_hotkey.keycode = KEY_C;
-    g_hotkey.description = "ALT+C";
+    g_hotkey.keycode = KEY_1;
+    g_hotkey.description = "ALT+1";
 
     // Read config file
     ReadConfigFile(g_hotkey);
@@ -675,14 +485,6 @@ int main(int argc, char* argv[])
     signal(SIGINT, SignalHandler);
     signal(SIGTERM, SignalHandler);
 
-    // Initialize X11 for cursor grabbing
-    g_display = XOpenDisplay(nullptr);
-    if (g_display) {
-        g_rootWindow = DefaultRootWindow(g_display);
-    } else {
-        std::cerr << "Warning: Could not open X display. Cursor confinement will use evdev grab only.\n";
-    }
-
     // Initialize socket
     g_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (g_sock < 0) {
@@ -699,8 +501,7 @@ int main(int argc, char* argv[])
     }
 
     // Find and open input devices
-    auto keyboards = FindInputDevices(true);
-    auto mice = FindInputDevices(false);
+    auto keyboards = FindKeyboardDevices();
 
     if (keyboards.empty()) {
         std::cerr << "No keyboard devices found. Make sure you have permission to read /dev/input/*\n";
@@ -709,11 +510,7 @@ int main(int argc, char* argv[])
         return 1;
     }
 
-    if (mice.empty()) {
-        std::cerr << "Warning: No mouse devices found\n";
-    }
-
-    std::cout << "Found " << keyboards.size() << " keyboard(s) and " << mice.size() << " mouse/mice\n";
+    std::cout << "Found " << keyboards.size() << " keyboard(s)\n";
 
     for (const auto& path : keyboards) {
         int fd = open(path.c_str(), O_RDONLY | O_NONBLOCK);
@@ -723,28 +520,17 @@ int main(int argc, char* argv[])
         }
     }
 
-    for (const auto& path : mice) {
-        int fd = open(path.c_str(), O_RDONLY | O_NONBLOCK);
-        if (fd >= 0) {
-            g_mouseFds.push_back(fd);
-            std::cout << "  Mouse: " << path << "\n";
-        }
-    }
-
     std::cout << "sender running -> target " << argv[1] << ":" << PORT << "\n";
-    std::cout << "press " << g_hotkey.description << " to toggle capture (blocks local input when ON)\n";
+    std::cout << "press " << g_hotkey.description << " to toggle the keyboard (mouse stays local)\n";
 
     // Main event loop using poll/select
     fd_set readfds;
     int maxfd = 0;
 
     for (int fd : g_keyboardFds) if (fd > maxfd) maxfd = fd;
-    for (int fd : g_mouseFds) if (fd > maxfd) maxfd = fd;
-
     while (g_running) {
         FD_ZERO(&readfds);
         for (int fd : g_keyboardFds) FD_SET(fd, &readfds);
-        for (int fd : g_mouseFds) FD_SET(fd, &readfds);
 
         timeval timeout{0, 10000};  // 10ms timeout
         int ret = select(maxfd + 1, &readfds, nullptr, nullptr, &timeout);
@@ -766,16 +552,6 @@ int main(int argc, char* argv[])
             }
         }
 
-        // Process mouse events
-        for (int fd : g_mouseFds) {
-            if (!FD_ISSET(fd, &readfds)) continue;
-
-            input_event ev;
-            while (read(fd, &ev, sizeof(ev)) == sizeof(ev)) {
-                ProcessMouseEventWithAccum(ev);
-            }
-        }
-
         // Handle hotkey toggle
         if (hotkey_triggered) {
             if (g_capturing.load()) {
@@ -791,9 +567,7 @@ int main(int argc, char* argv[])
     StopCapture();
 
     for (int fd : g_keyboardFds) close(fd);
-    for (int fd : g_mouseFds) close(fd);
 
-    if (g_display) XCloseDisplay(g_display);
     if (g_sock >= 0) close(g_sock);
 
     return 0;

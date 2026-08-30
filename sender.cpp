@@ -11,6 +11,8 @@
 #include <vector>
 #include <thread>
 
+#include "keyboard_protocol.h"
+
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "user32.lib")
 
@@ -29,39 +31,6 @@ struct HotkeyConfig {
     std::wstring description = L"ALT+1";
 };
 static HotkeyConfig g_hotkey;
-
-// ------------------------- protocol -----------------------
-struct InputPacket
-{
-    enum Type : uint8_t
-    {
-        MOUSE_MOVE,
-        MOUSE_BUTTON,
-        KEYBOARD,
-        MOUSE_WHEEL
-    } type;
-    union
-    {
-        struct
-        {
-            int x, y;
-        } mouse_move; // relative dx,dy
-        struct
-        {
-            uint8_t button;
-            bool down;
-        } mouse_button; // 0=L,1=R,2=M
-        struct
-        {
-            uint16_t vkCode;
-            bool down;
-        } keyboard; // virtual key
-        struct
-        {
-            int delta;
-        } mouse_wheel; // +120/-120
-    } data;
-};
 
 // ------------------------- clipboard protocol -------------
 #pragma pack(push, 1)
@@ -201,12 +170,8 @@ static std::atomic<bool> g_shuttingDown{false};
 static HWND g_msgWnd = nullptr;
 constexpr UINT WM_APP_TOGGLE = WM_APP + 1; // used by LL hook to toggle when capturing
 
-// hooks used only to BLOCK local input while capturing
-static HHOOK g_mouseHook = nullptr;
+// Hook used only to block and relay local keyboard input while capturing.
 static HHOOK g_keyHook = nullptr;
-
-// whether we currently have the cursor clipped
-static bool g_cursorClipped = false;
 
 // ------------------------- net ----------------------------
 static bool ResolveTarget()
@@ -229,7 +194,7 @@ static bool ResolveTarget()
     return true;
 }
 
-static inline void SendPacket(const InputPacket &p)
+static inline void SendPacket(const KeyboardPacket &p)
 {
     sendto(g_sock, reinterpret_cast<const char *>(&p), sizeof(p), 0,
            reinterpret_cast<const sockaddr *>(&g_recvAddr), sizeof(g_recvAddr));
@@ -519,46 +484,16 @@ static LRESULT CALLBACK LLKbdHook(int nCode, WPARAM wParam, LPARAM lParam)
     // Send keyboard packet directly from the hook since RIDEV_INPUTSINK doesn't work for keyboards
     // Note: this WOULD be better over Raw Input, but no matter what, I could NOT get the Raw Input messages for the keyboard to fire.
     // So for now, LL hook it is.
-    InputPacket p{};
-    p.type = InputPacket::KEYBOARD;
-    p.data.keyboard.vkCode = (uint16_t)vk;
-    p.data.keyboard.down = isDown;
+    KeyboardPacket p{};
+    p.vkCode = static_cast<uint16_t>(vk);
+    p.down = isDown ? 1 : 0;
     SendPacket(p);
 
     // block locally
     return 1;
 }
 
-static LRESULT CALLBACK LLMouHook(int nCode, WPARAM wParam, LPARAM lParam)
-{
-    if (nCode < 0)
-        return CallNextHookEx(nullptr, nCode, wParam, lParam);
-    if (!g_capturing.load(std::memory_order_relaxed))
-        return CallNextHookEx(nullptr, nCode, wParam, lParam);
-
-    // swallow all local mouse events during capture (cursor won't move / no clicks locally).
-    // mouse data capture happens via Raw Input (WM_INPUT), not here.
-    return 1;
-}
-
 // ------------------------- capture on/off -----------------
-static void ClipCursor1x1AtCurrent(bool enable)
-{
-    if (enable && !g_cursorClipped)
-    {
-        POINT c;
-        GetCursorPos(&c);
-        RECT r{c.x, c.y, c.x + 1, c.y + 1};
-        ClipCursor(&r);
-        g_cursorClipped = true;
-    }
-    else if (!enable && g_cursorClipped)
-    {
-        ClipCursor(nullptr);
-        g_cursorClipped = false;
-    }
-}
-
 static void StartCapture()
 {
     if (g_capturing.exchange(true))
@@ -572,49 +507,19 @@ static void StartCapture()
     is_shift_pressed_down.store(false, std::memory_order_relaxed);
     is_alt_pressed_down.store(false, std::memory_order_relaxed);
 
-    // register raw input as our mouse data source. zero overhead when unregistered (StopCapture).
-    RAWINPUTDEVICE rid[1]{};
-    rid[0].usUsagePage = 0x01;
-    rid[0].usUsage = 0x02; // mouse
-    rid[0].dwFlags = RIDEV_INPUTSINK;
-    rid[0].hwndTarget = g_msgWnd;
-    if (!RegisterRawInputDevices(rid, 1, sizeof(RAWINPUTDEVICE)))
-    {
-        std::wcerr << L"RegisterRawInputDevices failed: " << GetLastError() << L"\n";
-        g_capturing = false;
-        return;
-    }
-
-    // install LL hooks (eat local input — mouse hook blocks, kbd hook blocks + relays keys)
-    g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, LLMouHook, GetModuleHandleW(nullptr), 0);
+    // Install the keyboard hook only. The mouse remains local and untouched.
     g_keyHook = SetWindowsHookExW(WH_KEYBOARD_LL, LLKbdHook, GetModuleHandleW(nullptr), 0);
-    if (!g_mouseHook || !g_keyHook)
+    if (!g_keyHook)
     {
         std::wcerr << L"SetWindowsHookEx failed: " << GetLastError() << L"\n";
-        if (g_mouseHook)
-        {
-            UnhookWindowsHookEx(g_mouseHook);
-            g_mouseHook = nullptr;
-        }
-        if (g_keyHook)
-        {
-            UnhookWindowsHookEx(g_keyHook);
-            g_keyHook = nullptr;
-        }
-        rid[0].dwFlags = RIDEV_REMOVE;
-        rid[0].hwndTarget = nullptr;
-        RegisterRawInputDevices(rid, 1, sizeof(RAWINPUTDEVICE));
         g_capturing = false;
         return;
     }
-
-    // optional: pin the cursor so there's no flicker
-    ClipCursor1x1AtCurrent(true);
 
     if (!g_shuttingDown.load(std::memory_order_relaxed))
         std::thread(PushClipboardToReceiver).detach();
 
-    std::wcout << L"capture: ON (local input is blocked)\n";
+    std::wcout << L"capture: ON (local keyboard is blocked; mouse remains local)\n";
 }
 
 static void StopCapture()
@@ -624,15 +529,14 @@ static void StopCapture()
 
     // Key-up spam is harmless and prevents stuck remote modifiers after lag spikes.
     {
-        InputPacket p{};
-        p.type = InputPacket::KEYBOARD;
-        p.data.keyboard.down = false;
+        KeyboardPacket p{};
+        p.down = 0;
 
-        p.data.keyboard.vkCode = VK_CONTROL;
+        p.vkCode = VK_CONTROL;
         SendPacket(p);
-        p.data.keyboard.vkCode = VK_SHIFT;
+        p.vkCode = VK_SHIFT;
         SendPacket(p);
-        p.data.keyboard.vkCode = VK_MENU;
+        p.vkCode = VK_MENU;
         SendPacket(p);
 
         is_ctrl_pressed_down.store(false, std::memory_order_relaxed);
@@ -640,34 +544,17 @@ static void StopCapture()
         is_alt_pressed_down.store(false, std::memory_order_relaxed);
     }
 
-    // unregister raw input: no WM_INPUT traffic until next StartCapture.
-    {
-        RAWINPUTDEVICE rid[1]{};
-        rid[0].usUsagePage = 0x01;
-        rid[0].usUsage = 0x02; // mouse
-        rid[0].dwFlags = RIDEV_REMOVE;
-        rid[0].hwndTarget = nullptr;
-        RegisterRawInputDevices(rid, 1, sizeof(RAWINPUTDEVICE));
-    }
-
-    // remove LL hooks
-    if (g_mouseHook)
-    {
-        UnhookWindowsHookEx(g_mouseHook);
-        g_mouseHook = nullptr;
-    }
+    // Remove the keyboard hook.
     if (g_keyHook)
     {
         UnhookWindowsHookEx(g_keyHook);
         g_keyHook = nullptr;
     }
 
-    ClipCursor1x1AtCurrent(false);
-
     if (!g_shuttingDown.load(std::memory_order_relaxed))
         std::thread(PullClipboardFromReceiver).detach();
 
-    std::wcout << L"capture: OFF (local input restored)\n";
+    std::wcout << L"capture: OFF (local keyboard restored)\n";
 }
 
 // ------------------------- window proc --------------------
@@ -690,100 +577,6 @@ static LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                 StartCapture();
         }
         break;
-
-    case WM_INPUT:
-    {
-        if (!g_capturing.load(std::memory_order_relaxed))
-            return DefWindowProcW(hwnd, msg, wParam, lParam);
-
-        UINT size = 0;
-        if (GetRawInputData((HRAWINPUT)lParam, RID_INPUT, nullptr, &size, sizeof(RAWINPUTHEADER)) != 0 || size == 0)
-            return DefWindowProcW(hwnd, msg, wParam, lParam);
-
-        BYTE buf[1024];
-        if (size > sizeof(buf))
-            return DefWindowProcW(hwnd, msg, wParam, lParam);
-        if (GetRawInputData((HRAWINPUT)lParam, RID_INPUT, buf, &size, sizeof(RAWINPUTHEADER)) != size)
-            return DefWindowProcW(hwnd, msg, wParam, lParam);
-
-        RAWINPUT *ri = reinterpret_cast<RAWINPUT *>(buf);
-
-        if (ri->header.dwType == RIM_TYPEMOUSE)
-        {
-            const RAWMOUSE &m = ri->data.mouse;
-
-            // relative motion only
-            if (!(m.usFlags & MOUSE_MOVE_ABSOLUTE))
-            {
-                int dx = (int)m.lLastX;
-                int dy = (int)m.lLastY;
-                if ((dx | dy) != 0)
-                {
-                    InputPacket p{};
-                    p.type = InputPacket::MOUSE_MOVE;
-                    p.data.mouse_move.x = dx;
-                    p.data.mouse_move.y = dy;
-                    SendPacket(p);
-                }
-            }
-
-            // buttons
-            const USHORT f = m.usButtonFlags;
-            if (f & (RI_MOUSE_LEFT_BUTTON_DOWN | RI_MOUSE_LEFT_BUTTON_UP))
-            {
-                InputPacket p{};
-                p.type = InputPacket::MOUSE_BUTTON;
-                p.data.mouse_button.button = 0;
-                p.data.mouse_button.down = (f & RI_MOUSE_LEFT_BUTTON_DOWN) != 0;
-                SendPacket(p);
-            }
-            if (f & (RI_MOUSE_RIGHT_BUTTON_DOWN | RI_MOUSE_RIGHT_BUTTON_UP))
-            {
-                InputPacket p{};
-                p.type = InputPacket::MOUSE_BUTTON;
-                p.data.mouse_button.button = 1;
-                p.data.mouse_button.down = (f & RI_MOUSE_RIGHT_BUTTON_DOWN) != 0;
-                SendPacket(p);
-            }
-            if (f & (RI_MOUSE_MIDDLE_BUTTON_DOWN | RI_MOUSE_MIDDLE_BUTTON_UP))
-            {
-                InputPacket p{};
-                p.type = InputPacket::MOUSE_BUTTON;
-                p.data.mouse_button.button = 2;
-                p.data.mouse_button.down = (f & RI_MOUSE_MIDDLE_BUTTON_DOWN) != 0;
-                SendPacket(p);
-            }
-            if (f & (RI_MOUSE_BUTTON_4_DOWN | RI_MOUSE_BUTTON_4_UP))
-            {
-                InputPacket p{};
-                p.type = InputPacket::MOUSE_BUTTON;
-                p.data.mouse_button.button = 3;
-                p.data.mouse_button.down = (f & RI_MOUSE_BUTTON_4_DOWN) != 0;
-                SendPacket(p);
-            }
-            if (f & (RI_MOUSE_BUTTON_5_DOWN | RI_MOUSE_BUTTON_5_UP))
-            {
-                InputPacket p{};
-                p.type = InputPacket::MOUSE_BUTTON;
-                p.data.mouse_button.button = 4;
-                p.data.mouse_button.down = (f & RI_MOUSE_BUTTON_5_DOWN) != 0;
-                SendPacket(p);
-            }
-
-            // wheel
-            if (f & RI_MOUSE_WHEEL)
-            {
-                SHORT delta = (SHORT)m.usButtonData;
-                InputPacket p{};
-                p.type = InputPacket::MOUSE_WHEEL;
-                p.data.mouse_wheel.delta = (int)delta;
-                SendPacket(p);
-            }
-        }
-
-        // DefWindowProc frees the RAWINPUT buffer — required to avoid a leak per event
-        return DefWindowProcW(hwnd, msg, wParam, lParam);
-    }
 
     case WM_DESTROY:
         PostQuitMessage(0);
@@ -867,7 +660,7 @@ int wmain(int argc, wchar_t *argv[])
     WNDCLASSEXW wc{sizeof(WNDCLASSEXW)};
     wc.lpfnWndProc = HiddenWndProc;
     wc.hInstance = GetModuleHandleW(nullptr);
-    wc.lpszClassName = L"KMRawInputSenderWnd";
+    wc.lpszClassName = L"KeyboardSharingSenderWnd";
     if (!RegisterClassExW(&wc))
     {
         std::cerr << "RegisterClassExW failed\n";
@@ -896,7 +689,7 @@ int wmain(int argc, wchar_t *argv[])
     }
 
     std::wcout << L"sender running → target " << argv[1] << L":" << PORT << L"\n";
-    std::wcout << L"press " << g_hotkey.description << L" to toggle capture (blocks local input when ON)\n";
+    std::wcout << L"press " << g_hotkey.description << L" to toggle the keyboard (mouse stays local)\n";
 
     // message loop
     MSG msg;
@@ -909,7 +702,7 @@ int wmain(int argc, wchar_t *argv[])
     // cleanup
     g_shuttingDown.store(true);
     UnregisterHotKey(g_msgWnd, HOTKEY_ID);
-    StopCapture(); // ensures hooks uninstalled, raw input unregistered, cursor unclipped
+    StopCapture(); // ensures the keyboard hook is removed
     if (g_msgWnd)
         DestroyWindow(g_msgWnd);
     if (g_sock != INVALID_SOCKET)

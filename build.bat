@@ -1,5 +1,6 @@
 @echo off
-echo Building Keyboard/Mouse Switcher...
+cd /d "%~dp0"
+echo Building Keyboard Switcher with MinGW...
 
 gcc -O3 -static -o sender.exe sender.cpp -lws2_32 -municode -mwindows -lstdc++
 

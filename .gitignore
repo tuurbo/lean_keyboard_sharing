@@ -1,4 +1,6 @@
 *.exe
 *.o
+*.obj
+*.res
 sender_linux
 .claude

@@ -1,106 +1,106 @@
-# Ultra-Minimal Keyboard/Mouse Switcher
+# Lean Keyboard Sharing
 
-Zero-overhead keyboard/mouse sharing between two Windows PCs.
+A small keyboard-only switcher for two computers on the same local network.
 
-## Key Features
+Press one hotkey to send the Windows keyboard to the other computer. Press it
+again to return the keyboard to the local computer. The mouse always stays on
+its own computer: the sender does not capture or block it, and the receiver
+does not accept or inject mouse input.
 
-- **ZERO overhead when not in use** - Only hotkey monitoring runs
-- **Ultra-low latency** - Direct UDP packets, no buffering
-- **Clipboard sync** - Text and images synced automatically on toggle (up to 1GB)
-- **Multi-monitor support** - Per-monitor DPI-aware, works across any monitor layout
-- **UIAccess enabled** - Mouse works even through UAC elevation prompts
-- **Minimal dependencies** - Pure Win32 API, no external libraries
-- **Configurable hotkey** - Default ALT+1, configurable via CLI or config file
+## Features
 
-## Architecture
+- Keyboard-only sharing
+- Global toggle hotkey (`Alt+1` by default)
+- Direct UDP input with low latency
+- Clipboard text and image sync at toggle boundaries
+- Windows sender and receiver
+- Optional Linux sender
+- No service, driver, administrator access, or installation
 
-When inactive (99% of the time):
-- NO hooks installed (apart from the hotkey's)
-- NO Raw Input registration
-- NO capture/clipboard worker threads
-- NO network activity
-- NO polling loops
-- Essentially zero CPU/memory usage
+## How it works
 
-When active (after pressing hotkey):
-- Low-level hook captures keyboard input
-- Raw Input API captures mouse movement/buttons/wheel
-- Low-level mouse hook only blocks local mouse input
-- Direct UDP transmission to target PC
-- Input is blocked on source PC
-- Clipboard is synced via short-lived TCP only at toggle boundaries
+While sharing is off, the sender waits for the global hotkey. While sharing is
+on, it installs one low-level keyboard hook, forwards key presses and releases,
+and blocks those keys on the sender. It never installs a mouse hook, registers
+Raw Input for a mouse, confines the cursor, or sends mouse packets.
 
-## Building
+The receiver accepts only the keyboard protocol and uses Windows `SendInput`
+with `INPUT_KEYBOARD`. Packets from the original keyboard-and-mouse v1.2
+release are not compatible and are ignored.
 
-Requires MinGW with `gcc` and `windres` on PATH.
+Clipboard sync is separate from input. The sender pushes its clipboard when
+sharing turns on and pulls the receiver clipboard when sharing turns off.
+
+## Build on Windows
+
+Microsoft C++ Build Tools:
+
+```batch
+build_msvc.bat
+```
+
+MinGW with `gcc` and `windres` on `PATH`:
 
 ```batch
 build.bat
 ```
 
-Creates:
-- `sender.exe` - Run on gaming PC
-- `receiver.exe` - Run on streaming PC (windowless)
+Both commands create `sender.exe` and `receiver.exe`.
 
-## Usage
+## Use on Windows
 
-**On Streaming PC:**
-```
+On the computer that will receive the keyboard:
+
+```batch
 receiver.exe
 ```
-The receiver runs silently with no console window.
 
-**On Gaming PC:**
-```
-sender.exe 192.168.1.100
-sender.exe 192.168.1.100 --hotkey=ALT+2
-sender.exe 192.168.1.100 --hotkey=CTRL+SHIFT+K
-```
-(Replace with actual IP of streaming PC)
+The receiver runs silently. It does not require administrator access.
 
-Clipboard sync runs only at toggle boundaries: sender clipboard is pushed when capture turns on, and receiver clipboard is pulled back when capture turns off. There is no clipboard monitor, persistent TCP socket, or clipboard/network activity while idle.
+On the computer with the physical keyboard, replace the address with the
+receiver computer's IPv4 address:
 
-You can also set the hotkey in a `sender.cfg` file next to the exe:
+```batch
+sender.exe 192.168.0.231
 ```
+
+Press `Alt+1` to toggle the keyboard between the two computers. You can choose
+a different hotkey on the command line:
+
+```batch
+sender.exe 192.168.0.231 --hotkey=CTRL+SHIFT+K
+```
+
+You can also create `sender.cfg` beside `sender.exe`:
+
+```ini
 HOTKEY=ALT+1
 ```
 
-## Controls
+## Build the Linux sender
 
-- **ALT+1** (default) - Toggle control between PCs
-- `--hotkey=ALT+C` - Example custom toggle hotkey
+The Linux sender reads keyboard devices through `evdev`. It does not open or
+grab mouse devices.
+
+```bash
+./build_linux.sh
+./sender_linux 192.168.0.231
+```
+
+The user must have permission to read `/dev/input/event*`. The script prints
+the required group setup command when the permission is missing.
 
 ## Network
 
-- Port 7777 (UDP) - keyboard/mouse input
-- Port 7778 (TCP) - boundary clipboard sync
-- Ensure Windows Firewall allows both ports
-- Both PCs must be on same network
+- UDP 7777: keyboard input
+- TCP 7778: clipboard sync at toggle boundaries
 
-## Deployment (receiver)
-
-For the receiver to work through UAC prompts, it needs UIAccess which requires:
-1. The embedded manifest (`receiver.manifest`) with `uiAccess="true"`
-2. The exe to be Authenticode-signed (self-signed works)
-3. Installed in a trusted location (e.g. `C:\Program Files\KMReceiver\`)
-
-The included `deploy_receiver.ps1` automates this: creates a self-signed cert, signs the exe, copies to Program Files, and sets up a startup shortcut.
-
-## Performance
-
-- In idle state: ~0% CPU, <1MB RAM (0.7MB when I tested it)
-- When active: <1% CPU for input capture/transmission
-- Network: ~10KB/s during active mouse movement
-- Latency: <1ms on local network
-
-## Notes
-
-This program does NOT encrypt the content of the packets. This means that if you use this inside an unsafe network, this functionally becomes a keylogger that can be potentially sniffed by a malicious attacker on the network. Use at your own risk, if you understand what this does and who it's for.
+Allow these inbound ports for the receiver on the intended local network.
+The protocol is not encrypted or authenticated.
 
 ## License
 
-This project is licensed under the [PolyForm Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0/).
-
-You may use, modify, and share this code for personal or educational
-(non-commercial) purposes.
-Commercial use of any kind requires my explicit permission.
+This project uses the
+[PolyForm Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0/).
+You may use, modify, and share it for personal or educational, non-commercial
+purposes. Commercial use requires permission from the original author.
