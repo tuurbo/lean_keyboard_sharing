@@ -910,12 +910,14 @@ static void UpdateSenderTrayIcon()
     SetTrayIcon(g_trayIcon, g_msgWnd, TRAY_ICON_ID, WM_APP_TRAY, localActive, tooltip);
 }
 
-static void ShowReceiverConnectionFeedback(bool reached)
+static void ShowReceiverConnectionFailureIfNeeded(bool reached)
 {
+    if (reached)
+        return;
+
     ShowTrayNotification(
-        g_trayIcon, L"Keyboard Sharing",
-        reached ? L"Receiver reached" : L"No response from receiver",
-        reached ? NIIF_INFO : NIIF_WARNING);
+        g_trayIcon, L"Keyboard Sharing", L"No response from receiver",
+        NIIF_WARNING);
 }
 
 static void ShowSettingsWindow()
@@ -1136,7 +1138,7 @@ static void StartCapture()
     bool receiverReached = SendStatusAndWaitForAck(true);
     SetTimer(g_msgWnd, STATUS_TIMER_ID, STATUS_TIMER_MS, nullptr);
     UpdateSenderTrayIcon();
-    ShowReceiverConnectionFeedback(receiverReached);
+    ShowReceiverConnectionFailureIfNeeded(receiverReached);
 
     if (g_clipboardEnabled && !g_shuttingDown.load(std::memory_order_relaxed))
         StartClipboardTransfer(true);
@@ -1177,7 +1179,7 @@ static void StopCapture()
 
     bool receiverReached = SendStatusAndWaitForAck(false);
     UpdateSenderTrayIcon();
-    ShowReceiverConnectionFeedback(receiverReached);
+    ShowReceiverConnectionFailureIfNeeded(receiverReached);
 
     if (g_clipboardEnabled && !g_shuttingDown.load(std::memory_order_relaxed))
         StartClipboardTransfer(false);

@@ -12,7 +12,7 @@ does not accept or inject mouse input.
 - Keyboard-only sharing
 - Press-to-record global toggle hotkey (`Alt+1` by default)
 - Direct UDP input with low latency
-- Toggle-time receiver connection feedback
+- Toggle-time receiver connection failure warning
 - Green and gray keyboard-key tray status icons
 - Optional clipboard text and image sync, off by default
 - Optional per-user Windows startup
@@ -36,8 +36,9 @@ The sender and receiver show a keyboard-key tray icon. It is green on the
 computer that currently has the keyboard and gray on the other computer.
 
 The receiver acknowledges a status probe when the keyboard toggles. The sender
-then shows **Receiver reached** or **No response from receiver**. This check does
-not add polling or network traffic while the sender is idle.
+shows **No response from receiver** only when the probe fails. Successful
+toggles stay silent. This check does not add polling or network traffic while
+the sender is idle.
 
 Clipboard sync is separate from input and is off by default. If enabled in the
 sender settings, the sender pushes its clipboard when sharing turns on and
