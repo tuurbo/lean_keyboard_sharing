@@ -200,6 +200,16 @@ static inline void SendPacket(const KeyboardPacket &p)
            reinterpret_cast<const sockaddr *>(&g_recvAddr), sizeof(g_recvAddr));
 }
 
+static void SendStatusPacket(bool receiverActive, int repeatCount = 1)
+{
+    KeyboardStatusPacket packet{};
+    packet.receiverActive = receiverActive ? 1 : 0;
+    for (int i = 0; i < repeatCount; ++i) {
+        sendto(g_sock, reinterpret_cast<const char *>(&packet), sizeof(packet), 0,
+               reinterpret_cast<const sockaddr *>(&g_recvAddr), sizeof(g_recvAddr));
+    }
+}
+
 // ------------------------- hotkey parsing -----------------
 static int ParseKeyName(const std::string& keyName)
 {
@@ -326,6 +336,7 @@ static void StartCapture()
 
     // Grab evdev devices exclusively to block local input
     GrabEvdevDevices(true);
+    SendStatusPacket(true, 3);
 
     std::cout << "capture: ON (local keyboard is blocked; mouse remains local)\n";
 }
@@ -359,6 +370,7 @@ static void StopCapture()
 
     // Release evdev exclusive grab
     GrabEvdevDevices(false);
+    SendStatusPacket(false, 3);
 
     std::cout << "capture: OFF (local keyboard restored)\n";
 }
@@ -499,7 +511,6 @@ int main(int argc, char* argv[])
         close(g_sock);
         return 1;
     }
-
     // Find and open input devices
     auto keyboards = FindKeyboardDevices();
 
@@ -528,6 +539,7 @@ int main(int argc, char* argv[])
     int maxfd = 0;
 
     for (int fd : g_keyboardFds) if (fd > maxfd) maxfd = fd;
+    auto nextStatusHeartbeat = std::chrono::steady_clock::now();
     while (g_running) {
         FD_ZERO(&readfds);
         for (int fd : g_keyboardFds) FD_SET(fd, &readfds);
@@ -559,6 +571,12 @@ int main(int argc, char* argv[])
             } else {
                 StartCapture();
             }
+        }
+
+        auto now = std::chrono::steady_clock::now();
+        if (g_capturing.load() && now >= nextStatusHeartbeat) {
+            SendStatusPacket(true);
+            nextStatusHeartbeat = now + std::chrono::seconds(1);
         }
     }
 

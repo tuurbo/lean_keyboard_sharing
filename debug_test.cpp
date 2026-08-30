@@ -1,6 +1,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <cstring>
 #include <iomanip>
 #include <iostream>
 
@@ -74,14 +75,29 @@ int main()
         int received = recvfrom(sock, reinterpret_cast<char *>(&packet), sizeof(packet), 0,
                                 reinterpret_cast<sockaddr *>(&senderAddr), &senderAddrSize);
 
-        if (received != sizeof(packet) ||
-            packet.magic != KEYBOARD_PACKET_MAGIC ||
-            packet.version != KEYBOARD_PACKET_VERSION ||
-            packet.vkCode == 0 || packet.down > 1)
+        if (received != sizeof(packet))
             continue;
 
         char senderIP[INET_ADDRSTRLEN]{};
         inet_ntop(AF_INET, &senderAddr.sin_addr, senderIP, sizeof(senderIP));
+
+        if (packet.magic == KEYBOARD_STATUS_MAGIC)
+        {
+            KeyboardStatusPacket status{};
+            std::memcpy(&status, &packet, sizeof(status));
+            if (status.version == KEYBOARD_PACKET_VERSION && status.receiverActive <= 1)
+            {
+                std::cout << "[status] From " << senderIP << " - Keyboard: "
+                          << (status.receiverActive ? "RECEIVER" : "SENDER") << std::endl;
+            }
+            continue;
+        }
+
+        if (packet.magic != KEYBOARD_PACKET_MAGIC ||
+            packet.version != KEYBOARD_PACKET_VERSION ||
+            packet.vkCode == 0 || packet.down > 1)
+            continue;
+
         std::cout << "[#" << std::setw(4) << ++packetCount << "] From " << senderIP
                   << " - Key: " << GetKeyName(packet.vkCode)
                   << " (" << packet.vkCode << ") "

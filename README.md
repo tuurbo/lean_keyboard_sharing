@@ -12,7 +12,8 @@ does not accept or inject mouse input.
 - Keyboard-only sharing
 - Global toggle hotkey (`Alt+1` by default)
 - Direct UDP input with low latency
-- Clipboard text and image sync at toggle boundaries
+- Green and gray keyboard-key tray status icons
+- Optional clipboard text and image sync, off by default
 - Windows sender and receiver
 - Optional Linux sender
 - No service, driver, administrator access, or installation
@@ -28,8 +29,12 @@ The receiver accepts only the keyboard protocol and uses Windows `SendInput`
 with `INPUT_KEYBOARD`. Packets from the original keyboard-and-mouse v1.2
 release are not compatible and are ignored.
 
-Clipboard sync is separate from input. The sender pushes its clipboard when
-sharing turns on and pulls the receiver clipboard when sharing turns off.
+The sender and receiver show a keyboard-key tray icon. It is green on the
+computer that currently has the keyboard and gray on the other computer.
+
+Clipboard sync is separate from input and is off by default. If enabled in the
+sender settings, the sender pushes its clipboard when sharing turns on and
+pulls the receiver clipboard when sharing turns off.
 
 ## Build on Windows
 
@@ -55,27 +60,36 @@ On the computer that will receive the keyboard:
 dist\receiver.exe
 ```
 
-The receiver runs silently. It does not require administrator access.
+The receiver runs in the notification area. Right-click its tray icon to see
+the current keyboard owner or exit. It does not require administrator access.
 
-On the computer with the physical keyboard, replace the address with the
-receiver computer's IPv4 address:
+On the computer with the physical keyboard:
+
+```batch
+dist\sender.exe
+```
+
+Enter the receiver computer's IPv4 address or host name in the settings window
+and select **Save**. Double-click the tray icon to open these settings again.
+Right-click it to toggle the keyboard, open settings, or exit.
+
+Press `Alt+1` to toggle the keyboard between the two computers. An address on
+the command line is still accepted as a temporary override:
 
 ```batch
 dist\sender.exe 192.168.0.231
 ```
 
-Press `Alt+1` to toggle the keyboard between the two computers. You can choose
-a different hotkey on the command line:
-
-```batch
-dist\sender.exe 192.168.0.231 --hotkey=CTRL+SHIFT+K
-```
-
-You can also create `sender.cfg` beside `sender.exe`:
+The settings window creates `sender.cfg` beside `sender.exe`:
 
 ```ini
+RECEIVER=192.168.0.231
 HOTKEY=ALT+1
+CLIPBOARD=0
 ```
+
+Set `CLIPBOARD=1` or select **Enable clipboard sharing** in the settings window
+to opt in.
 
 ## Build the Linux sender
 
@@ -93,7 +107,7 @@ the required group setup command when the permission is missing.
 ## Network
 
 - UDP 7777: keyboard input
-- TCP 7778: clipboard sync at toggle boundaries
+- TCP 7778: optional clipboard sync at toggle boundaries
 
 Allow these inbound ports for the receiver on the intended local network.
 The protocol is not encrypted or authenticated.
