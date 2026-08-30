@@ -27,3 +27,4 @@ This repository is a small keyboard-only sharing tool. Keep it keyboard-only.
 - `build_msvc.bat`: Microsoft C++ Build Tools
 - `build.bat`: MinGW
 - `build_linux.sh`: Linux sender
+- All compiled programs go in `dist/`.

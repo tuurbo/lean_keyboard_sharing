@@ -2,7 +2,10 @@
 cd /d "%~dp0"
 echo Building Keyboard Switcher with MinGW...
 
-gcc -O3 -static -o sender.exe sender.cpp -lws2_32 -municode -mwindows -lstdc++
+set "OUTPUT_DIR=dist"
+if not exist "%OUTPUT_DIR%" mkdir "%OUTPUT_DIR%"
+
+gcc -O3 -static -o "%OUTPUT_DIR%\sender.exe" sender.cpp -lws2_32 -municode -mwindows -lstdc++
 
 if %ERRORLEVEL% NEQ 0 (
     echo Failed to build sender.exe
@@ -15,7 +18,7 @@ if %ERRORLEVEL% NEQ 0 (
     exit /b 1
 )
 
-gcc -O3 -static -mwindows -o receiver.exe receiver.cpp receiver_res.o -lws2_32 -luser32 -lstdc++
+gcc -O3 -static -mwindows -o "%OUTPUT_DIR%\receiver.exe" receiver.cpp receiver_res.o -lws2_32 -luser32 -lstdc++
 if %ERRORLEVEL% NEQ 0 (
     echo Failed to build receiver.exe
     exit /b 1
@@ -25,6 +28,6 @@ echo.
 echo Build successful!
 echo.
 echo Files created:
-echo   - sender.exe   (run on gaming PC)
-echo   - receiver.exe (run on streaming PC)
+echo   - %OUTPUT_DIR%\sender.exe   (run on gaming PC)
+echo   - %OUTPUT_DIR%\receiver.exe (run on receiving PC)
 echo.

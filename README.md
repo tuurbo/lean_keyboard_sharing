@@ -45,14 +45,14 @@ MinGW with `gcc` and `windres` on `PATH`:
 build.bat
 ```
 
-Both commands create `sender.exe` and `receiver.exe`.
+Both commands create `dist\sender.exe` and `dist\receiver.exe`.
 
 ## Use on Windows
 
 On the computer that will receive the keyboard:
 
 ```batch
-receiver.exe
+dist\receiver.exe
 ```
 
 The receiver runs silently. It does not require administrator access.
@@ -61,14 +61,14 @@ On the computer with the physical keyboard, replace the address with the
 receiver computer's IPv4 address:
 
 ```batch
-sender.exe 192.168.0.231
+dist\sender.exe 192.168.0.231
 ```
 
 Press `Alt+1` to toggle the keyboard between the two computers. You can choose
 a different hotkey on the command line:
 
 ```batch
-sender.exe 192.168.0.231 --hotkey=CTRL+SHIFT+K
+dist\sender.exe 192.168.0.231 --hotkey=CTRL+SHIFT+K
 ```
 
 You can also create `sender.cfg` beside `sender.exe`:
@@ -84,7 +84,7 @@ grab mouse devices.
 
 ```bash
 ./build_linux.sh
-./sender_linux 192.168.0.231
+./dist/sender_linux 192.168.0.231
 ```
 
 The user must have permission to read `/dev/input/event*`. The script prints

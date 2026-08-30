@@ -3,4 +3,5 @@
 *.obj
 *.res
 sender_linux
+dist/
 .claude
