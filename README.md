@@ -52,6 +52,20 @@ build.bat
 
 Both commands create `dist\sender.exe` and `dist\receiver.exe`.
 
+## Automated Windows builds
+
+GitHub Actions builds both Windows programs on every push and pull request. It
+uploads `sender.exe`, `receiver.exe`, and `SHA256SUMS.txt` as one workflow
+artifact.
+
+Push a tag whose name starts with `v` to publish the same files in a GitHub
+release:
+
+```bash
+git tag v1.3.0
+git push origin v1.3.0
+```
+
 ## Use on Windows
 
 On the computer that will receive the keyboard:
