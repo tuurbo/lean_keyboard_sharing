@@ -138,3 +138,21 @@ static inline void RemoveTrayIcon(TrayIconState &state)
         DestroyIcon(state.icon);
     state = {};
 }
+
+static inline bool ShowTrayNotification(
+    const TrayIconState &state, const wchar_t *title,
+    const wchar_t *message, DWORD flags)
+{
+    if (!state.added)
+        return false;
+
+    NOTIFYICONDATAW data{};
+    data.cbSize = sizeof(data);
+    data.hWnd = state.data.hWnd;
+    data.uID = state.data.uID;
+    data.uFlags = NIF_INFO;
+    data.dwInfoFlags = flags;
+    lstrcpynW(data.szInfoTitle, title, ARRAYSIZE(data.szInfoTitle));
+    lstrcpynW(data.szInfo, message, ARRAYSIZE(data.szInfo));
+    return Shell_NotifyIconW(NIM_MODIFY, &data) != FALSE;
+}

@@ -7,13 +7,16 @@
 #include <array>
 #include <cstring>
 
+#include "clipboard_protocol.h"
 #include "keyboard_protocol.h"
 #include "tray_icon.h"
+#include "windows_app.h"
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "gdi32.lib")
+#pragma comment(lib, "advapi32.lib")
 
 constexpr int PORT = 7777;
 static constexpr UINT TRAY_ICON_ID = 1;
@@ -22,28 +25,14 @@ static constexpr UINT WM_APP_TRAY = WM_APP + 1;
 static constexpr UINT WM_APP_RECEIVER_STATE = WM_APP + 2;
 static constexpr UINT WM_APP_RECEIVER_ERROR = WM_APP + 3;
 static constexpr UINT STATUS_TIMEOUT_MS = 3000;
-static constexpr int IDM_EXIT = 2001;
+static constexpr int IDM_START_WITH_WINDOWS = 2001;
+static constexpr int IDM_EXIT = 2002;
+static constexpr wchar_t STARTUP_VALUE_NAME[] = L"LeanKeyboardSharingReceiver";
 
 // ------------------------- clipboard protocol -------------
 static constexpr int CLIP_PORT = 7778;
-static constexpr uint32_t CLIP_MAX_SIZE = 1024 * 1024 * 1024; // 1 GB
 static constexpr DWORD CLIP_IO_TIMEOUT_MS = 3000;
 static constexpr long CLIP_IDLE_TIMEOUT_SEC = 5;
-
-#pragma pack(push, 1)
-struct ClipHeader
-{
-    uint8_t msg_type;      // 0=CLIP_DATA, 1=CLIP_REQUEST
-    uint8_t content_type;  // 0=empty, 1=text(UTF-16LE), 2=image(DIB)
-    uint32_t data_length;  // followed by this many bytes
-};
-#pragma pack(pop)
-
-static constexpr uint8_t CLIP_MSG_DATA = 0;
-static constexpr uint8_t CLIP_MSG_REQUEST = 1;
-static constexpr uint8_t CLIP_CONTENT_EMPTY = 0;
-static constexpr uint8_t CLIP_CONTENT_TEXT = 1;
-static constexpr uint8_t CLIP_CONTENT_IMAGE = 2;
 
 static bool TcpSendAll(SOCKET s, const char *buf, int len)
 {
@@ -67,90 +56,6 @@ static bool TcpRecvAll(SOCKET s, char *buf, int len)
         len -= got;
     }
     return true;
-}
-
-static void ReadClipboard(uint8_t &content_type, std::vector<char> &data)
-{
-    content_type = CLIP_CONTENT_EMPTY;
-    data.clear();
-
-    // Retry a few times — the clipboard may be briefly locked by the
-    // screenshot tool or another process that just wrote to it.
-    for (int attempt = 0; attempt < 10; ++attempt)
-    {
-        if (OpenClipboard(nullptr))
-            break;
-        Sleep(50);
-        if (attempt == 9)
-            return;
-    }
-
-    // try image first (CF_DIB)
-    HANDLE hDib = GetClipboardData(CF_DIB);
-    if (hDib)
-    {
-        SIZE_T sz = GlobalSize(hDib);
-        if (sz > 0 && sz <= CLIP_MAX_SIZE)
-        {
-            void *ptr = GlobalLock(hDib);
-            if (ptr)
-            {
-                data.assign(static_cast<char *>(ptr), static_cast<char *>(ptr) + sz);
-                GlobalUnlock(hDib);
-                content_type = CLIP_CONTENT_IMAGE;
-                CloseClipboard();
-                return;
-            }
-        }
-    }
-
-    // fall back to text (CF_UNICODETEXT)
-    HANDLE hText = GetClipboardData(CF_UNICODETEXT);
-    if (hText)
-    {
-        SIZE_T sz = GlobalSize(hText);
-        if (sz > 0 && sz <= CLIP_MAX_SIZE)
-        {
-            void *ptr = GlobalLock(hText);
-            if (ptr)
-            {
-                data.assign(static_cast<char *>(ptr), static_cast<char *>(ptr) + sz);
-                GlobalUnlock(hText);
-                content_type = CLIP_CONTENT_TEXT;
-            }
-        }
-    }
-
-    CloseClipboard();
-}
-
-static void WriteClipboard(uint8_t content_type, const std::vector<char> &data)
-{
-    if (content_type == CLIP_CONTENT_EMPTY || data.empty())
-        return;
-
-    if (!OpenClipboard(nullptr))
-        return;
-    EmptyClipboard();
-
-    UINT fmt = (content_type == CLIP_CONTENT_IMAGE) ? CF_DIB : CF_UNICODETEXT;
-    HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, data.size());
-    if (hMem)
-    {
-        void *ptr = GlobalLock(hMem);
-        if (ptr)
-        {
-            memcpy(ptr, data.data(), data.size());
-            GlobalUnlock(hMem);
-            SetClipboardData(fmt, hMem);
-        }
-        else
-        {
-            GlobalFree(hMem);
-        }
-    }
-
-    CloseClipboard();
 }
 
 static std::atomic<bool> g_running{true};
@@ -234,23 +139,28 @@ static void ClipboardThread()
 
             if (hdr.msg_type == CLIP_MSG_DATA)
             {
-                // sender is pushing its clipboard to us
-                if (hdr.data_length > CLIP_MAX_SIZE)
+                if (!IsClipboardDataHeaderValid(hdr))
                     break;
 
                 std::vector<char> clipData(hdr.data_length);
-                if (hdr.data_length > 0 && !TcpRecvAll(client, clipData.data(), (int)hdr.data_length))
+                if (hdr.data_length > 0 &&
+                    !TcpRecvAll(client, clipData.data(), static_cast<int>(hdr.data_length)))
+                    break;
+                if (!IsClipboardPayloadValid(
+                        hdr.content_type, clipData.data(), clipData.size()))
                     break;
 
-                WriteClipboard(hdr.content_type, clipData);
+                WriteLocalClipboard(hdr.content_type, clipData);
                 break;
             }
             else if (hdr.msg_type == CLIP_MSG_REQUEST)
             {
-                // sender wants our clipboard
+                if (!IsClipboardRequestValid(hdr))
+                    break;
+
                 uint8_t ct;
                 std::vector<char> clipData;
-                ReadClipboard(ct, clipData);
+                ReadLocalClipboard(ct, clipData);
 
                 ClipHeader resp{};
                 resp.msg_type = CLIP_MSG_DATA;
@@ -304,6 +214,21 @@ static void SetReceiverActive(bool active)
         PostMessageW(g_window, WM_APP_RECEIVER_STATE, active ? 1 : 0, 0);
 }
 
+static void SendStatusAcknowledgement(
+    SOCKET socket, const sockaddr_in &senderAddress, int senderAddressSize,
+    const KeyboardStatusPacket &status)
+{
+    if (status.requestId == 0)
+        return;
+
+    KeyboardAckPacket acknowledgement{};
+    acknowledgement.receiverActive = status.receiverActive;
+    acknowledgement.requestId = status.requestId;
+    sendto(socket, reinterpret_cast<const char *>(&acknowledgement),
+           sizeof(acknowledgement), 0,
+           reinterpret_cast<const sockaddr *>(&senderAddress), senderAddressSize);
+}
+
 static void ReceiverThread()
 {
     SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -338,6 +263,7 @@ static void ReceiverThread()
     bool receiverFailed = false;
     while (g_running)
     {
+        senderAddrSize = sizeof(senderAddr);
         int received = recvfrom(sock, packetBytes.data(), static_cast<int>(packetBytes.size()), 0,
                                 (sockaddr *)&senderAddr, &senderAddrSize);
 
@@ -357,7 +283,11 @@ static void ReceiverThread()
                 KeyboardStatusPacket status{};
                 std::memcpy(&status, packetBytes.data(), sizeof(status));
                 if (status.version == KEYBOARD_PACKET_VERSION && status.receiverActive <= 1)
+                {
                     SetReceiverActive(status.receiverActive != 0);
+                    SendStatusAcknowledgement(
+                        sock, senderAddr, senderAddrSize, status);
+                }
             }
         }
         else if (received == SOCKET_ERROR)
@@ -417,6 +347,10 @@ static void ShowReceiverTrayMenu()
     AppendMenuW(menu, MF_STRING | MF_GRAYED, 0,
                 active ? L"This PC has the keyboard" : L"Sender has the keyboard");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    bool startWithWindows = IsStartupEnabled(STARTUP_VALUE_NAME);
+    AppendMenuW(menu, MF_STRING | (startWithWindows ? MF_CHECKED : MF_UNCHECKED),
+                IDM_START_WITH_WINDOWS, L"Start with Windows");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, IDM_EXIT, L"Exit");
 
     POINT cursor{};
@@ -426,7 +360,15 @@ static void ShowReceiverTrayMenu()
                                  cursor.x, cursor.y, 0, g_window, nullptr);
     DestroyMenu(menu);
 
-    if (command == IDM_EXIT)
+    if (command == IDM_START_WITH_WINDOWS)
+    {
+        if (!SetStartupEnabled(STARTUP_VALUE_NAME, !startWithWindows))
+        {
+            MessageBoxW(nullptr, L"The Windows startup setting could not be changed.",
+                        L"Keyboard Sharing", MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
+        }
+    }
+    else if (command == IDM_EXIT)
         RequestReceiverExit();
 }
 
@@ -482,6 +424,18 @@ static LRESULT CALLBACK ReceiverWndProc(HWND hwnd, UINT message, WPARAM wParam, 
 
 int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int)
 {
+    SingleInstanceGuard instanceGuard;
+    if (!instanceGuard.Acquire(L"Local\\LeanKeyboardSharingReceiverInstance"))
+    {
+        MessageBoxW(
+            nullptr,
+            instanceGuard.AlreadyRunning()
+                ? L"Keyboard Sharing Receiver is already running."
+                : L"Keyboard Sharing Receiver could not create its instance lock.",
+            L"Keyboard Sharing", MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND);
+        return instanceGuard.AlreadyRunning() ? 0 : 1;
+    }
+
     WSADATA wsaData;
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
         return 1;

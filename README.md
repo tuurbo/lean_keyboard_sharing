@@ -10,10 +10,13 @@ does not accept or inject mouse input.
 ## Features
 
 - Keyboard-only sharing
-- Global toggle hotkey (`Alt+1` by default)
+- Press-to-record global toggle hotkey (`Alt+1` by default)
 - Direct UDP input with low latency
+- Toggle-time receiver connection feedback
 - Green and gray keyboard-key tray status icons
 - Optional clipboard text and image sync, off by default
+- Optional per-user Windows startup
+- Single sender and receiver instance per Windows session
 - Windows sender and receiver
 - Optional Linux sender
 - No service, driver, administrator access, or installation
@@ -32,9 +35,15 @@ release are not compatible and are ignored.
 The sender and receiver show a keyboard-key tray icon. It is green on the
 computer that currently has the keyboard and gray on the other computer.
 
+The receiver acknowledges a status probe when the keyboard toggles. The sender
+then shows **Receiver reached** or **No response from receiver**. This check does
+not add polling or network traffic while the sender is idle.
+
 Clipboard sync is separate from input and is off by default. If enabled in the
 sender settings, the sender pushes its clipboard when sharing turns on and
-pulls the receiver clipboard when sharing turns off.
+pulls the receiver clipboard when sharing turns off. Only one clipboard
+transfer can run at a time. Transfers accept validated UTF-16 text up to 8 MiB
+or validated DIB images up to 64 MiB.
 
 ## Build on Windows
 
@@ -75,7 +84,8 @@ dist\receiver.exe
 ```
 
 The receiver runs in the notification area. Right-click its tray icon to see
-the current keyboard owner or exit. It does not require administrator access.
+the current keyboard owner, enable **Start with Windows**, or exit. It does not
+require administrator access.
 
 On the computer with the physical keyboard:
 
@@ -84,8 +94,10 @@ dist\sender.exe
 ```
 
 Enter the receiver computer's IPv4 address or host name in the settings window
-and select **Save**. Double-click the tray icon to open these settings again.
-Right-click it to toggle the keyboard, open settings, or exit.
+and press the wanted keyboard shortcut in the hotkey field. The settings also
+include clipboard sharing and **Start with Windows** checkboxes. Select **Save**.
+Double-click the tray icon to open these settings again. Right-click it to
+toggle the keyboard, open settings, or exit.
 
 Press `Alt+1` to toggle the keyboard between the two computers. An address on
 the command line is still accepted as a temporary override:
@@ -104,6 +116,10 @@ CLIPBOARD=0
 
 Set `CLIPBOARD=1` or select **Enable clipboard sharing** in the settings window
 to opt in.
+
+The startup options use the current user's Windows startup registry entry. They
+do not require administrator access. Both programs also prevent a second copy
+of the same program from running in the current Windows session.
 
 ## Build the Linux sender
 

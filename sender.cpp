@@ -11,12 +11,17 @@
 #include <fstream>
 #include <string>
 #include <algorithm>
+#include <cwchar>
 #include <cwctype>
+#include <array>
 #include <vector>
 #include <thread>
+#include <mutex>
 
+#include "clipboard_protocol.h"
 #include "keyboard_protocol.h"
 #include "tray_icon.h"
+#include "windows_app.h"
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "user32.lib")
@@ -24,6 +29,7 @@
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "uxtheme.lib")
+#pragma comment(lib, "advapi32.lib")
 
 // ------------------------- config -------------------------
 static constexpr int PORT = 7777;
@@ -32,14 +38,17 @@ static constexpr int HOTKEY_ID = 1;
 static constexpr UINT TRAY_ICON_ID = 1;
 static constexpr UINT STATUS_TIMER_ID = 2;
 static constexpr UINT STATUS_TIMER_MS = 1000;
-static constexpr uint32_t CLIP_MAX_SIZE = 1024 * 1024 * 1024; // 1 GB
+static constexpr DWORD STATUS_ACK_TIMEOUT_MS = 600;
 static constexpr DWORD CLIP_CONNECT_TIMEOUT_MS = 1000;
 static constexpr DWORD CLIP_IO_TIMEOUT_MS = 3000;
+static constexpr wchar_t STARTUP_VALUE_NAME[] = L"LeanKeyboardSharingSender";
 
 static constexpr int IDC_TARGET_EDIT = 1001;
 static constexpr int IDC_CLIPBOARD_CHECK = 1002;
 static constexpr int IDC_SAVE_SETTINGS = 1003;
 static constexpr int IDC_CANCEL_SETTINGS = 1004;
+static constexpr int IDC_HOTKEY_EDIT = 1005;
+static constexpr int IDC_STARTUP_CHECK = 1006;
 static constexpr int IDM_TOGGLE_KEYBOARD = 2001;
 static constexpr int IDM_SETTINGS = 2002;
 static constexpr int IDM_EXIT = 2003;
@@ -55,22 +64,7 @@ struct HotkeyConfig {
     std::wstring description = L"ALT+1";
 };
 static HotkeyConfig g_hotkey;
-
-// ------------------------- clipboard protocol -------------
-#pragma pack(push, 1)
-struct ClipHeader
-{
-    uint8_t msg_type;      // 0=CLIP_DATA, 1=CLIP_REQUEST
-    uint8_t content_type;  // 0=empty, 1=text(UTF-16LE), 2=image(DIB)
-    uint32_t data_length;  // followed by this many bytes
-};
-#pragma pack(pop)
-
-static constexpr uint8_t CLIP_MSG_DATA = 0;
-static constexpr uint8_t CLIP_MSG_REQUEST = 1;
-static constexpr uint8_t CLIP_CONTENT_EMPTY = 0;
-static constexpr uint8_t CLIP_CONTENT_TEXT = 1;
-static constexpr uint8_t CLIP_CONTENT_IMAGE = 2;
+static HotkeyConfig g_pendingHotkey;
 
 // ------------------------- TCP helpers --------------------
 static bool TcpSendAll(SOCKET s, const char *buf, int len)
@@ -97,90 +91,6 @@ static bool TcpRecvAll(SOCKET s, char *buf, int len)
     return true;
 }
 
-// ------------------------- clipboard helpers ---------------
-static void ReadClipboard(uint8_t &content_type, std::vector<char> &data)
-{
-    content_type = CLIP_CONTENT_EMPTY;
-    data.clear();
-
-    // Retry a few times — the clipboard may be briefly locked by another process.
-    for (int attempt = 0; attempt < 10; ++attempt)
-    {
-        if (OpenClipboard(nullptr))
-            break;
-        Sleep(50);
-        if (attempt == 9)
-            return;
-    }
-
-    // try image first (CF_DIB)
-    HANDLE hDib = GetClipboardData(CF_DIB);
-    if (hDib)
-    {
-        SIZE_T sz = GlobalSize(hDib);
-        if (sz > 0 && sz <= CLIP_MAX_SIZE)
-        {
-            void *ptr = GlobalLock(hDib);
-            if (ptr)
-            {
-                data.assign(static_cast<char *>(ptr), static_cast<char *>(ptr) + sz);
-                GlobalUnlock(hDib);
-                content_type = CLIP_CONTENT_IMAGE;
-                CloseClipboard();
-                return;
-            }
-        }
-    }
-
-    // fall back to text (CF_UNICODETEXT)
-    HANDLE hText = GetClipboardData(CF_UNICODETEXT);
-    if (hText)
-    {
-        SIZE_T sz = GlobalSize(hText);
-        if (sz > 0 && sz <= CLIP_MAX_SIZE)
-        {
-            void *ptr = GlobalLock(hText);
-            if (ptr)
-            {
-                data.assign(static_cast<char *>(ptr), static_cast<char *>(ptr) + sz);
-                GlobalUnlock(hText);
-                content_type = CLIP_CONTENT_TEXT;
-            }
-        }
-    }
-
-    CloseClipboard();
-}
-
-static void WriteClipboard(uint8_t content_type, const std::vector<char> &data)
-{
-    if (content_type == CLIP_CONTENT_EMPTY || data.empty())
-        return;
-
-    if (!OpenClipboard(nullptr))
-        return;
-    EmptyClipboard();
-
-    UINT fmt = (content_type == CLIP_CONTENT_IMAGE) ? CF_DIB : CF_UNICODETEXT;
-    HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, data.size());
-    if (hMem)
-    {
-        void *ptr = GlobalLock(hMem);
-        if (ptr)
-        {
-            memcpy(ptr, data.data(), data.size());
-            GlobalUnlock(hMem);
-            SetClipboardData(fmt, hMem);
-        }
-        else
-        {
-            GlobalFree(hMem);
-        }
-    }
-
-    CloseClipboard();
-}
-
 // ------------------------- globals ------------------------
 static std::atomic<bool> g_capturing{false};
 static std::atomic<bool> is_shift_pressed_down{false};
@@ -195,11 +105,24 @@ static bool g_targetIsLiteralIp = false;
 static bool g_targetConfigured = false;
 static bool g_clipboardEnabled = false;
 static std::atomic<bool> g_shuttingDown{false};
+struct ClipboardTransferRequest
+{
+    bool pushToReceiver = false;
+    in_addr receiverAddress{};
+};
+static std::mutex g_clipboardTransferMutex;
+static bool g_clipboardTransferActive = false;
+static bool g_clipboardTransferPending = false;
+static ClipboardTransferRequest g_pendingClipboardTransfer;
+static std::thread g_clipboardThread;
+static std::uint16_t g_statusRequestId = 0;
 static HWND g_msgWnd = nullptr;
 static HWND g_targetLabel = nullptr;
 static HWND g_targetEdit = nullptr;
 static HWND g_clipboardCheck = nullptr;
 static HWND g_hotkeyLabel = nullptr;
+static HWND g_hotkeyEdit = nullptr;
+static HWND g_startupCheck = nullptr;
 static HWND g_saveButton = nullptr;
 static HWND g_cancelButton = nullptr;
 static HFONT g_uiFont = nullptr;
@@ -207,6 +130,8 @@ static HBRUSH g_darkBackgroundBrush = nullptr;
 static HBRUSH g_darkControlBrush = nullptr;
 static TrayIconState g_trayIcon;
 static UINT g_taskbarCreatedMessage = 0;
+static WNDPROC g_originalHotkeyEditProc = nullptr;
+static bool g_hotkeyRegistered = false;
 constexpr UINT WM_APP_TOGGLE = WM_APP + 1; // used by LL hook to toggle when capturing
 constexpr UINT WM_APP_TRAY = WM_APP + 2;
 
@@ -232,8 +157,9 @@ static void ApplySettingsDpi(HWND window, UINT dpi)
         L"Segoe UI");
     if (newFont)
     {
-        HWND controls[] = {g_targetLabel, g_targetEdit, g_clipboardCheck,
-                           g_hotkeyLabel, g_saveButton, g_cancelButton};
+        HWND controls[] = {g_targetLabel, g_targetEdit, g_hotkeyLabel,
+                           g_hotkeyEdit, g_clipboardCheck, g_startupCheck,
+                           g_saveButton, g_cancelButton};
         for (HWND control : controls)
             SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(newFont), TRUE);
         if (g_uiFont)
@@ -247,17 +173,23 @@ static void ApplySettingsDpi(HWND window, UINT dpi)
     MoveWindow(g_targetEdit,
                ScaleForDpi(20, dpi), ScaleForDpi(43, dpi),
                ScaleForDpi(350, dpi), ScaleForDpi(25, dpi), TRUE);
-    MoveWindow(g_clipboardCheck,
-               ScaleForDpi(20, dpi), ScaleForDpi(82, dpi),
-               ScaleForDpi(260, dpi), ScaleForDpi(24, dpi), TRUE);
     MoveWindow(g_hotkeyLabel,
-               ScaleForDpi(20, dpi), ScaleForDpi(113, dpi),
-               ScaleForDpi(250, dpi), ScaleForDpi(20, dpi), TRUE);
+               ScaleForDpi(20, dpi), ScaleForDpi(82, dpi),
+               ScaleForDpi(110, dpi), ScaleForDpi(20, dpi), TRUE);
+    MoveWindow(g_hotkeyEdit,
+               ScaleForDpi(140, dpi), ScaleForDpi(78, dpi),
+               ScaleForDpi(230, dpi), ScaleForDpi(25, dpi), TRUE);
+    MoveWindow(g_clipboardCheck,
+               ScaleForDpi(20, dpi), ScaleForDpi(117, dpi),
+               ScaleForDpi(260, dpi), ScaleForDpi(24, dpi), TRUE);
+    MoveWindow(g_startupCheck,
+               ScaleForDpi(20, dpi), ScaleForDpi(147, dpi),
+               ScaleForDpi(260, dpi), ScaleForDpi(24, dpi), TRUE);
     MoveWindow(g_saveButton,
-               ScaleForDpi(214, dpi), ScaleForDpi(145, dpi),
+               ScaleForDpi(214, dpi), ScaleForDpi(181, dpi),
                ScaleForDpi(75, dpi), ScaleForDpi(26, dpi), TRUE);
     MoveWindow(g_cancelButton,
-               ScaleForDpi(295, dpi), ScaleForDpi(145, dpi),
+               ScaleForDpi(295, dpi), ScaleForDpi(181, dpi),
                ScaleForDpi(75, dpi), ScaleForDpi(26, dpi), TRUE);
 
     RedrawWindow(window, nullptr, nullptr,
@@ -365,17 +297,89 @@ static inline void SendPacket(const KeyboardPacket &p)
            reinterpret_cast<const sockaddr *>(&g_recvAddr), sizeof(g_recvAddr));
 }
 
-static void SendStatusPacket(bool receiverActive, int repeatCount = 1)
+static void SendStatusPacket(
+    bool receiverActive, int repeatCount = 1, std::uint16_t requestId = 0)
 {
     if (!g_targetConfigured || g_sock == INVALID_SOCKET)
         return;
 
     KeyboardStatusPacket packet{};
     packet.receiverActive = receiverActive ? 1 : 0;
+    packet.requestId = requestId;
     for (int i = 0; i < repeatCount; ++i)
     {
         sendto(g_sock, reinterpret_cast<const char *>(&packet), sizeof(packet), 0,
                reinterpret_cast<const sockaddr *>(&g_recvAddr), sizeof(g_recvAddr));
+    }
+}
+
+static void DrainStatusResponses()
+{
+    for (;;)
+    {
+        fd_set readSet;
+        FD_ZERO(&readSet);
+        FD_SET(g_sock, &readSet);
+        timeval timeout{};
+        if (select(0, &readSet, nullptr, nullptr, &timeout) <= 0)
+            return;
+
+        std::array<char, sizeof(KeyboardAckPacket)> bytes{};
+        sockaddr_in source{};
+        int sourceSize = sizeof(source);
+        if (recvfrom(g_sock, bytes.data(), static_cast<int>(bytes.size()), 0,
+                     reinterpret_cast<sockaddr *>(&source), &sourceSize) <= 0)
+        {
+            return;
+        }
+    }
+}
+
+static bool SendStatusAndWaitForAck(bool receiverActive)
+{
+    if (!g_targetConfigured || g_sock == INVALID_SOCKET)
+        return false;
+
+    DrainStatusResponses();
+    if (++g_statusRequestId == 0)
+        ++g_statusRequestId;
+    const std::uint16_t requestId = g_statusRequestId;
+    SendStatusPacket(receiverActive, 3, requestId);
+
+    ULONGLONG deadline = GetTickCount64() + STATUS_ACK_TIMEOUT_MS;
+    for (;;)
+    {
+        ULONGLONG now = GetTickCount64();
+        if (now >= deadline)
+            return false;
+
+        DWORD remaining = static_cast<DWORD>(deadline - now);
+        fd_set readSet;
+        FD_ZERO(&readSet);
+        FD_SET(g_sock, &readSet);
+        timeval timeout{
+            static_cast<long>(remaining / 1000),
+            static_cast<long>((remaining % 1000) * 1000)};
+        if (select(0, &readSet, nullptr, nullptr, &timeout) <= 0)
+            return false;
+
+        KeyboardAckPacket acknowledgement{};
+        sockaddr_in source{};
+        int sourceSize = sizeof(source);
+        int received = recvfrom(
+            g_sock, reinterpret_cast<char *>(&acknowledgement),
+            sizeof(acknowledgement), 0,
+            reinterpret_cast<sockaddr *>(&source), &sourceSize);
+        if (received == sizeof(acknowledgement) &&
+            source.sin_addr.s_addr == g_recvAddr.sin_addr.s_addr &&
+            source.sin_port == g_recvAddr.sin_port &&
+            acknowledgement.magic == KEYBOARD_ACK_MAGIC &&
+            acknowledgement.version == KEYBOARD_PACKET_VERSION &&
+            acknowledgement.receiverActive == (receiverActive ? 1 : 0) &&
+            acknowledgement.requestId == requestId)
+        {
+            return true;
+        }
     }
 }
 
@@ -445,7 +449,7 @@ static void PushClipboardToReceiver(in_addr receiverAddress)
 {
     uint8_t clipCt;
     std::vector<char> clipPayload;
-    ReadClipboard(clipCt, clipPayload);
+    ReadLocalClipboard(clipCt, clipPayload);
 
     if (g_shuttingDown.load(std::memory_order_relaxed))
         return;
@@ -484,15 +488,18 @@ static void PullClipboardFromReceiver(in_addr receiverAddress)
     {
         ClipHeader resp{};
         if (TcpRecvAll(cs, reinterpret_cast<char *>(&resp), sizeof(resp)) &&
-            resp.msg_type == CLIP_MSG_DATA &&
-            resp.data_length <= CLIP_MAX_SIZE)
+            IsClipboardDataHeaderValid(resp))
         {
             clipData.resize(resp.data_length);
             if (resp.data_length == 0 ||
                 TcpRecvAll(cs, clipData.data(), static_cast<int>(resp.data_length)))
             {
-                respType = resp.content_type;
-                gotClipboard = true;
+                if (IsClipboardPayloadValid(
+                        resp.content_type, clipData.data(), clipData.size()))
+                {
+                    respType = resp.content_type;
+                    gotClipboard = true;
+                }
             }
         }
     }
@@ -500,65 +507,261 @@ static void PullClipboardFromReceiver(in_addr receiverAddress)
     closesocket(cs);
 
     if (gotClipboard && !g_shuttingDown.load(std::memory_order_relaxed))
-        WriteClipboard(respType, clipData);
+        WriteLocalClipboard(respType, clipData);
+}
+
+static void StartClipboardTransfer(bool pushToReceiver)
+{
+    if (g_shuttingDown.load(std::memory_order_relaxed))
+        return;
+
+    ClipboardTransferRequest request{pushToReceiver, g_recvAddr.sin_addr};
+    {
+        std::lock_guard<std::mutex> lock(g_clipboardTransferMutex);
+        if (g_clipboardTransferActive)
+        {
+            g_pendingClipboardTransfer = request;
+            g_clipboardTransferPending = true;
+            return;
+        }
+        g_clipboardTransferActive = true;
+    }
+
+    if (g_clipboardThread.joinable())
+        g_clipboardThread.join();
+
+    try
+    {
+        g_clipboardThread = std::thread([request]() mutable {
+            for (;;)
+            {
+                try
+                {
+                    if (request.pushToReceiver)
+                        PushClipboardToReceiver(request.receiverAddress);
+                    else
+                        PullClipboardFromReceiver(request.receiverAddress);
+                }
+                catch (...)
+                {
+                }
+
+                std::lock_guard<std::mutex> lock(g_clipboardTransferMutex);
+                if (!g_shuttingDown.load(std::memory_order_relaxed) &&
+                    g_clipboardTransferPending)
+                {
+                    request = g_pendingClipboardTransfer;
+                    g_clipboardTransferPending = false;
+                    continue;
+                }
+
+                g_clipboardTransferPending = false;
+                g_clipboardTransferActive = false;
+                return;
+            }
+        });
+    }
+    catch (...)
+    {
+        std::lock_guard<std::mutex> lock(g_clipboardTransferMutex);
+        g_clipboardTransferPending = false;
+        g_clipboardTransferActive = false;
+    }
 }
 
 // ------------------------- hotkey parsing -----------------
-static bool ParseHotkey(const std::wstring& hotkeyStr, HotkeyConfig& config)
+static bool GetHotkeyKeyName(UINT key, std::wstring &name)
 {
-    std::wstring str = hotkeyStr;
-    // convert to uppercase for case-insensitive parsing
-    std::transform(str.begin(), str.end(), str.begin(), ::towupper);
-
-    UINT mods = 0;
-    UINT key = 0;
-
-    // parse modifiers
-    if (str.find(L"CTRL") != std::wstring::npos || str.find(L"CONTROL") != std::wstring::npos)
-        mods |= MOD_CONTROL;
-    if (str.find(L"SHIFT") != std::wstring::npos)
-        mods |= MOD_SHIFT;
-    if (str.find(L"ALT") != std::wstring::npos)
-        mods |= MOD_ALT;
-    if (str.find(L"WIN") != std::wstring::npos)
-        mods |= MOD_WIN;
-
-    // find the key (last character that's not '+')
-    size_t lastPlus = str.rfind(L'+');
-    if (lastPlus != std::wstring::npos && lastPlus < str.length() - 1)
+    if ((key >= '0' && key <= '9') || (key >= 'A' && key <= 'Z'))
     {
-        std::wstring keyStr = str.substr(lastPlus + 1);
-        // trim whitespace
-        keyStr.erase(0, keyStr.find_first_not_of(L" \t"));
-        keyStr.erase(keyStr.find_last_not_of(L" \t") + 1);
-
-        if (keyStr.length() == 1)
-        {
-            wchar_t c = keyStr[0];
-            if ((c >= L'0' && c <= L'9') || (c >= L'A' && c <= L'Z'))
-            {
-                key = (UINT)c;
-            }
-        }
-        else if (keyStr.length() == 2 && keyStr[0] == L'F' && keyStr[1] >= L'1' && keyStr[1] <= L'9')
-        {
-            // F1-F9
-            key = VK_F1 + (keyStr[1] - L'1');
-        }
-        else if (keyStr.length() == 3 && keyStr[0] == L'F' && keyStr[1] == L'1' && keyStr[2] >= L'0' && keyStr[2] <= L'2')
-        {
-            // F10-F12
-            key = VK_F10 + (keyStr[2] - L'0');
-        }
+        name.assign(1, static_cast<wchar_t>(key));
+        return true;
     }
+    if (key >= VK_F1 && key <= VK_F24)
+    {
+        name = L"F" + std::to_wstring(key - VK_F1 + 1);
+        return true;
+    }
+    return false;
+}
 
-    if (key == 0)
+static std::wstring FormatHotkey(const HotkeyConfig &config)
+{
+    std::wstring description;
+    if (config.modifiers & MOD_CONTROL)
+        description += L"CTRL+";
+    if (config.modifiers & MOD_SHIFT)
+        description += L"SHIFT+";
+    if (config.modifiers & MOD_ALT)
+        description += L"ALT+";
+    if (config.modifiers & MOD_WIN)
+        description += L"WIN+";
+
+    std::wstring keyName;
+    if (GetHotkeyKeyName(config.key, keyName))
+        description += keyName;
+    return description;
+}
+
+static bool ParseHotkey(const std::wstring &hotkeyText, HotkeyConfig &config)
+{
+    std::wstring text = hotkeyText;
+    std::transform(text.begin(), text.end(), text.begin(), ::towupper);
+
+    std::vector<std::wstring> parts;
+    std::size_t start = 0;
+    for (;;)
+    {
+        std::size_t plus = text.find(L'+', start);
+        std::wstring part = text.substr(
+            start, plus == std::wstring::npos ? plus : plus - start);
+        std::size_t first = part.find_first_not_of(L" \t");
+        std::size_t last = part.find_last_not_of(L" \t");
+        if (first == std::wstring::npos)
+            return false;
+        parts.push_back(part.substr(first, last - first + 1));
+        if (plus == std::wstring::npos)
+            break;
+        start = plus + 1;
+    }
+    if (parts.empty())
         return false;
 
-    config.modifiers = mods;
-    config.key = key;
-    config.description = hotkeyStr;
+    HotkeyConfig parsed{};
+    parsed.modifiers = 0;
+    parsed.key = 0;
+    for (std::size_t i = 0; i + 1 < parts.size(); ++i)
+    {
+        if (parts[i] == L"CTRL" || parts[i] == L"CONTROL")
+            parsed.modifiers |= MOD_CONTROL;
+        else if (parts[i] == L"SHIFT")
+            parsed.modifiers |= MOD_SHIFT;
+        else if (parts[i] == L"ALT")
+            parsed.modifiers |= MOD_ALT;
+        else if (parts[i] == L"WIN")
+            parsed.modifiers |= MOD_WIN;
+        else
+            return false;
+    }
+
+    const std::wstring &keyName = parts.back();
+    if (keyName.size() == 1 &&
+        ((keyName[0] >= L'0' && keyName[0] <= L'9') ||
+         (keyName[0] >= L'A' && keyName[0] <= L'Z')))
+    {
+        parsed.key = static_cast<UINT>(keyName[0]);
+    }
+    else if (keyName.size() >= 2 && keyName[0] == L'F')
+    {
+        wchar_t *end = nullptr;
+        long number = std::wcstol(keyName.c_str() + 1, &end, 10);
+        if (!end || *end != L'\0' || number < 1 || number > 24)
+            return false;
+        parsed.key = VK_F1 + static_cast<UINT>(number - 1);
+    }
+    else
+    {
+        return false;
+    }
+
+    parsed.description = FormatHotkey(parsed);
+    config = parsed;
     return true;
+}
+
+static bool IsModifierKey(UINT key)
+{
+    return key == VK_SHIFT || key == VK_LSHIFT || key == VK_RSHIFT ||
+           key == VK_CONTROL || key == VK_LCONTROL || key == VK_RCONTROL ||
+           key == VK_MENU || key == VK_LMENU || key == VK_RMENU ||
+           key == VK_LWIN || key == VK_RWIN;
+}
+
+static UINT GetPressedHotkeyModifiers()
+{
+    UINT modifiers = 0;
+    if (GetKeyState(VK_CONTROL) < 0)
+        modifiers |= MOD_CONTROL;
+    if (GetKeyState(VK_SHIFT) < 0)
+        modifiers |= MOD_SHIFT;
+    if (GetKeyState(VK_MENU) < 0)
+        modifiers |= MOD_ALT;
+    if (GetKeyState(VK_LWIN) < 0 || GetKeyState(VK_RWIN) < 0)
+        modifiers |= MOD_WIN;
+    return modifiers;
+}
+
+static bool RegisterConfiguredHotkey(const HotkeyConfig &config)
+{
+    if (!RegisterHotKey(g_msgWnd, HOTKEY_ID, config.modifiers, config.key))
+        return false;
+    g_hotkeyRegistered = true;
+    return true;
+}
+
+static void UnregisterConfiguredHotkey()
+{
+    if (g_hotkeyRegistered)
+    {
+        UnregisterHotKey(g_msgWnd, HOTKEY_ID);
+        g_hotkeyRegistered = false;
+    }
+}
+
+static LRESULT CALLBACK HotkeyEditProc(
+    HWND window, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    switch (message)
+    {
+    case WM_GETDLGCODE:
+        return DLGC_WANTALLKEYS;
+
+    case WM_SETFOCUS:
+        UnregisterConfiguredHotkey();
+        break;
+
+    case WM_KILLFOCUS:
+        if (!g_hotkeyRegistered && g_msgWnd)
+            RegisterConfiguredHotkey(g_hotkey);
+        break;
+
+    case WM_KEYDOWN:
+    case WM_SYSKEYDOWN:
+    {
+        UINT key = static_cast<UINT>(wParam);
+        if (key == VK_ESCAPE)
+        {
+            g_pendingHotkey = g_hotkey;
+            SetWindowTextW(window, g_pendingHotkey.description.c_str());
+            return 0;
+        }
+        if (IsModifierKey(key))
+            return 0;
+
+        std::wstring keyName;
+        UINT modifiers = GetPressedHotkeyModifiers();
+        if (modifiers == 0 || !GetHotkeyKeyName(key, keyName))
+        {
+            MessageBeep(MB_ICONWARNING);
+            return 0;
+        }
+
+        g_pendingHotkey.modifiers = modifiers;
+        g_pendingHotkey.key = key;
+        g_pendingHotkey.description = FormatHotkey(g_pendingHotkey);
+        SetWindowTextW(window, g_pendingHotkey.description.c_str());
+        return 0;
+    }
+
+    case WM_KEYUP:
+    case WM_SYSKEYUP:
+    case WM_CHAR:
+    case WM_SYSCHAR:
+        return 0;
+    }
+
+    return CallWindowProcW(
+        g_originalHotkeyEditProc, window, message, wParam, lParam);
 }
 
 static std::wstring Trim(const std::wstring &value)
@@ -707,14 +910,26 @@ static void UpdateSenderTrayIcon()
     SetTrayIcon(g_trayIcon, g_msgWnd, TRAY_ICON_ID, WM_APP_TRAY, localActive, tooltip);
 }
 
+static void ShowReceiverConnectionFeedback(bool reached)
+{
+    ShowTrayNotification(
+        g_trayIcon, L"Keyboard Sharing",
+        reached ? L"Receiver reached" : L"No response from receiver",
+        reached ? NIIF_INFO : NIIF_WARNING);
+}
+
 static void ShowSettingsWindow()
 {
     if (g_capturing.load(std::memory_order_relaxed))
         StopCapture();
 
     SetWindowTextW(g_targetEdit, g_targetText.c_str());
+    g_pendingHotkey = g_hotkey;
+    SetWindowTextW(g_hotkeyEdit, g_pendingHotkey.description.c_str());
     SendMessageW(g_clipboardCheck, BM_SETCHECK,
                  g_clipboardEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(g_startupCheck, BM_SETCHECK,
+                 IsStartupEnabled(STARTUP_VALUE_NAME) ? BST_CHECKED : BST_UNCHECKED, 0);
 
     RECT windowRect{};
     GetWindowRect(g_msgWnd, &windowRect);
@@ -728,6 +943,32 @@ static void ShowSettingsWindow()
     SetForegroundWindow(g_msgWnd);
     SetFocus(g_targetEdit);
     SendMessageW(g_targetEdit, EM_SETSEL, 0, -1);
+}
+
+static bool ApplyPendingHotkey()
+{
+    if (g_pendingHotkey.modifiers == g_hotkey.modifiers &&
+        g_pendingHotkey.key == g_hotkey.key)
+    {
+        if (g_hotkeyRegistered || RegisterConfiguredHotkey(g_hotkey))
+            return true;
+    }
+    else
+    {
+        HotkeyConfig previous = g_hotkey;
+        UnregisterConfiguredHotkey();
+        if (RegisterConfiguredHotkey(g_pendingHotkey))
+        {
+            g_hotkey = g_pendingHotkey;
+            return true;
+        }
+        RegisterConfiguredHotkey(previous);
+    }
+
+    MessageBoxW(g_msgWnd, L"That keyboard shortcut is in use by another application.",
+                L"Keyboard Sharing", MB_OK | MB_ICONWARNING);
+    SetFocus(g_hotkeyEdit);
+    return false;
 }
 
 static bool SaveSettingsFromWindow()
@@ -745,6 +986,39 @@ static bool SaveSettingsFromWindow()
         return false;
     }
 
+    const sockaddr_in previousAddress = g_recvAddr;
+    const std::string previousHost = g_targetHost;
+    const std::wstring previousTargetText = g_targetText;
+    const bool previousLiteral = g_targetIsLiteralIp;
+    const bool previousTargetConfigured = g_targetConfigured;
+    const bool previousClipboardEnabled = g_clipboardEnabled;
+    const HotkeyConfig previousHotkey = g_hotkey;
+
+    auto restoreRuntimeSettings = [&]() {
+        g_recvAddr = previousAddress;
+        g_targetHost = previousHost;
+        g_targetText = previousTargetText;
+        g_targetIsLiteralIp = previousLiteral;
+        g_targetConfigured = previousTargetConfigured;
+        g_clipboardEnabled = previousClipboardEnabled;
+
+        if (g_hotkey.modifiers != previousHotkey.modifiers ||
+            g_hotkey.key != previousHotkey.key)
+        {
+            HotkeyConfig currentHotkey = g_hotkey;
+            UnregisterConfiguredHotkey();
+            if (RegisterConfiguredHotkey(previousHotkey))
+            {
+                g_hotkey = previousHotkey;
+            }
+            else
+            {
+                RegisterConfiguredHotkey(currentHotkey);
+                g_hotkey = currentHotkey;
+            }
+        }
+    };
+
     if (!ConfigureTarget(target))
     {
         MessageBoxW(g_msgWnd, L"The receiver address could not be found.",
@@ -753,12 +1027,30 @@ static bool SaveSettingsFromWindow()
         return false;
     }
 
-    g_clipboardEnabled = SendMessageW(g_clipboardCheck, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    if (!ApplyPendingHotkey())
+    {
+        restoreRuntimeSettings();
+        return false;
+    }
+
+    g_clipboardEnabled =
+        SendMessageW(g_clipboardCheck, BM_GETCHECK, 0, 0) == BST_CHECKED;
     if (!SaveSettingsFile())
     {
+        restoreRuntimeSettings();
         MessageBoxW(g_msgWnd, L"The settings file could not be saved beside sender.exe.",
                     L"Keyboard Sharing", MB_OK | MB_ICONERROR);
         return false;
+    }
+
+    bool startWithWindows =
+        SendMessageW(g_startupCheck, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    if (!SetStartupEnabled(STARTUP_VALUE_NAME, startWithWindows))
+    {
+        MessageBoxW(
+            g_msgWnd,
+            L"The other settings were saved, but the Windows startup setting could not be changed.",
+            L"Keyboard Sharing", MB_OK | MB_ICONERROR);
     }
 
     ShowWindow(g_msgWnd, SW_HIDE);
@@ -841,12 +1133,13 @@ static void StartCapture()
         return;
     }
 
-    SendStatusPacket(true, 3);
+    bool receiverReached = SendStatusAndWaitForAck(true);
     SetTimer(g_msgWnd, STATUS_TIMER_ID, STATUS_TIMER_MS, nullptr);
     UpdateSenderTrayIcon();
+    ShowReceiverConnectionFeedback(receiverReached);
 
     if (g_clipboardEnabled && !g_shuttingDown.load(std::memory_order_relaxed))
-        std::thread(PushClipboardToReceiver, g_recvAddr.sin_addr).detach();
+        StartClipboardTransfer(true);
 
     std::wcout << L"capture: ON (local keyboard is blocked; mouse remains local)\n";
 }
@@ -882,11 +1175,12 @@ static void StopCapture()
         g_keyHook = nullptr;
     }
 
-    SendStatusPacket(false, 3);
+    bool receiverReached = SendStatusAndWaitForAck(false);
     UpdateSenderTrayIcon();
+    ShowReceiverConnectionFeedback(receiverReached);
 
     if (g_clipboardEnabled && !g_shuttingDown.load(std::memory_order_relaxed))
-        std::thread(PullClipboardFromReceiver, g_recvAddr.sin_addr).detach();
+        StartClipboardTransfer(false);
 
     std::wcout << L"capture: OFF (local keyboard restored)\n";
 }
@@ -918,10 +1212,19 @@ static LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                                            0, 0, 1, 1, hwnd,
                                            reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_CLIPBOARD_CHECK)),
                                            nullptr, nullptr);
-        std::wstring hotkeyText = L"Keyboard toggle: " + g_hotkey.description;
-        g_hotkeyLabel = CreateWindowExW(0, L"STATIC", hotkeyText.c_str(),
+        g_hotkeyLabel = CreateWindowExW(0, L"STATIC", L"Keyboard toggle:",
                                         WS_CHILD | WS_VISIBLE,
                                         0, 0, 1, 1, hwnd, nullptr, nullptr, nullptr);
+        g_hotkeyEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", g_hotkey.description.c_str(),
+                                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_READONLY | ES_CENTER,
+                                        0, 0, 1, 1, hwnd,
+                                        reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_HOTKEY_EDIT)),
+                                        nullptr, nullptr);
+        g_startupCheck = CreateWindowExW(0, L"BUTTON", L"Start with Windows",
+                                          WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                                          0, 0, 1, 1, hwnd,
+                                          reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_STARTUP_CHECK)),
+                                          nullptr, nullptr);
         g_saveButton = CreateWindowExW(0, L"BUTTON", L"Save",
                                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
                                        0, 0, 1, 1, hwnd,
@@ -934,9 +1237,19 @@ static LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                                          nullptr, nullptr);
 
         SetWindowTheme(g_targetEdit, L"DarkMode_CFD", nullptr);
+        SetWindowTheme(g_hotkeyEdit, L"DarkMode_CFD", nullptr);
         SetWindowTheme(g_clipboardCheck, L"DarkMode_Explorer", nullptr);
+        SetWindowTheme(g_startupCheck, L"DarkMode_Explorer", nullptr);
         SetWindowTheme(g_saveButton, L"DarkMode_Explorer", nullptr);
         SetWindowTheme(g_cancelButton, L"DarkMode_Explorer", nullptr);
+
+        SetLastError(ERROR_SUCCESS);
+        g_originalHotkeyEditProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(
+            g_hotkeyEdit, GWLP_WNDPROC,
+            reinterpret_cast<LONG_PTR>(HotkeyEditProc)));
+        if (!g_originalHotkeyEditProc && GetLastError() != ERROR_SUCCESS)
+            return -1;
+
         ApplySettingsDpi(hwnd, GetDpiForWindow(hwnd));
         return 0;
     }
@@ -1008,12 +1321,20 @@ static LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         }
         if (LOWORD(wParam) == IDC_CANCEL_SETTINGS)
         {
+            g_pendingHotkey = g_hotkey;
+            SetWindowTextW(g_hotkeyEdit, g_hotkey.description.c_str());
+            if (!g_hotkeyRegistered)
+                RegisterConfiguredHotkey(g_hotkey);
             ShowWindow(hwnd, SW_HIDE);
             return 0;
         }
         break;
 
     case WM_CLOSE:
+        g_pendingHotkey = g_hotkey;
+        SetWindowTextW(g_hotkeyEdit, g_hotkey.description.c_str());
+        if (!g_hotkeyRegistered)
+            RegisterConfiguredHotkey(g_hotkey);
         ShowWindow(hwnd, SW_HIDE);
         return 0;
 
@@ -1031,6 +1352,18 @@ static LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
 // ------------------------- entry --------------------------
 int wmain(int argc, wchar_t *argv[])
 {
+    SingleInstanceGuard instanceGuard;
+    if (!instanceGuard.Acquire(L"Local\\LeanKeyboardSharingSenderInstance"))
+    {
+        MessageBoxW(
+            nullptr,
+            instanceGuard.AlreadyRunning()
+                ? L"Keyboard Sharing Sender is already running."
+                : L"Keyboard Sharing Sender could not create its instance lock.",
+            L"Keyboard Sharing", MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND);
+        return instanceGuard.AlreadyRunning() ? 0 : 1;
+    }
+
     if (!SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2))
         SetProcessDPIAware();
 
@@ -1112,7 +1445,7 @@ int wmain(int argc, wchar_t *argv[])
     RECT windowRect{
         0, 0,
         ScaleForDpi(390, initialDpi),
-        ScaleForDpi(190, initialDpi)};
+        ScaleForDpi(225, initialDpi)};
     AdjustWindowRectExForDpi(
         &windowRect, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
         FALSE, WS_EX_TOOLWINDOW, initialDpi);
@@ -1132,7 +1465,7 @@ int wmain(int argc, wchar_t *argv[])
     }
 
     // register dynamic hotkey (toggle capture)
-    if (!RegisterHotKey(g_msgWnd, HOTKEY_ID, g_hotkey.modifiers, g_hotkey.key))
+    if (!RegisterConfiguredHotkey(g_hotkey))
     {
         MessageBoxW(nullptr, L"The keyboard hotkey is in use by another application.",
                     L"Keyboard Sharing", MB_OK | MB_ICONERROR);
@@ -1165,10 +1498,12 @@ int wmain(int argc, wchar_t *argv[])
     g_shuttingDown.store(true, std::memory_order_relaxed);
     if (g_capturing.load(std::memory_order_relaxed))
         StopCapture();
-    UnregisterHotKey(g_msgWnd, HOTKEY_ID);
+    UnregisterConfiguredHotkey();
     RemoveTrayIcon(g_trayIcon);
     if (g_msgWnd && IsWindow(g_msgWnd))
         DestroyWindow(g_msgWnd);
+    if (g_clipboardThread.joinable())
+        g_clipboardThread.join();
     if (g_sock != INVALID_SOCKET)
         closesocket(g_sock);
     WSACleanup();

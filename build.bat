@@ -5,7 +5,7 @@ echo Building Keyboard Switcher with MinGW...
 set "OUTPUT_DIR=dist"
 if not exist "%OUTPUT_DIR%" mkdir "%OUTPUT_DIR%"
 
-gcc -O3 -static -o "%OUTPUT_DIR%\sender.exe" sender.cpp -lws2_32 -luser32 -lshell32 -lgdi32 -ldwmapi -luxtheme -municode -mwindows -lstdc++
+gcc -O3 -static -o "%OUTPUT_DIR%\sender.exe" sender.cpp -lws2_32 -luser32 -lshell32 -lgdi32 -ldwmapi -luxtheme -ladvapi32 -municode -mwindows -lstdc++
 
 if %ERRORLEVEL% NEQ 0 (
     echo Failed to build sender.exe
@@ -18,7 +18,7 @@ if %ERRORLEVEL% NEQ 0 (
     exit /b 1
 )
 
-gcc -O3 -static -mwindows -o "%OUTPUT_DIR%\receiver.exe" receiver.cpp receiver_res.o -lws2_32 -luser32 -lshell32 -lgdi32 -lstdc++
+gcc -O3 -static -mwindows -o "%OUTPUT_DIR%\receiver.exe" receiver.cpp receiver_res.o -lws2_32 -luser32 -lshell32 -lgdi32 -ladvapi32 -lstdc++
 if %ERRORLEVEL% NEQ 0 (
     echo Failed to build receiver.exe
     exit /b 1

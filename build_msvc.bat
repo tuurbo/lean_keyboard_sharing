@@ -24,10 +24,10 @@ if not exist "%OUTPUT_DIR%" mkdir "%OUTPUT_DIR%"
 rc.exe /nologo /fo receiver_res.res receiver.rc
 if errorlevel 1 exit /b 1
 
-cl.exe /nologo /O2 /EHsc /MT /DUNICODE /D_UNICODE /Fe:"%OUTPUT_DIR%\sender.exe" sender.cpp /link /SUBSYSTEM:WINDOWS /ENTRY:wmainCRTStartup ws2_32.lib user32.lib shell32.lib gdi32.lib dwmapi.lib uxtheme.lib
+cl.exe /nologo /O2 /EHsc /MT /DUNICODE /D_UNICODE /Fe:"%OUTPUT_DIR%\sender.exe" sender.cpp /link /SUBSYSTEM:WINDOWS /ENTRY:wmainCRTStartup ws2_32.lib user32.lib shell32.lib gdi32.lib dwmapi.lib uxtheme.lib advapi32.lib
 if errorlevel 1 exit /b 1
 
-cl.exe /nologo /O2 /EHsc /MT /DUNICODE /D_UNICODE /Fe:"%OUTPUT_DIR%\receiver.exe" receiver.cpp receiver_res.res /link /SUBSYSTEM:WINDOWS ws2_32.lib user32.lib shell32.lib gdi32.lib
+cl.exe /nologo /O2 /EHsc /MT /DUNICODE /D_UNICODE /Fe:"%OUTPUT_DIR%\receiver.exe" receiver.cpp receiver_res.res /link /SUBSYSTEM:WINDOWS ws2_32.lib user32.lib shell32.lib gdi32.lib advapi32.lib
 if errorlevel 1 exit /b 1
 
 del /q sender.obj receiver.obj receiver_res.res >nul 2>nul
