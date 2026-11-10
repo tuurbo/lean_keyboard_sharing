@@ -18,6 +18,11 @@
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "advapi32.lib")
 
+// MinGW's winuser.h only defines this when _WIN32_WINNT >= 0x0600.
+#ifndef MAPVK_VK_TO_VSC_EX
+#define MAPVK_VK_TO_VSC_EX 4
+#endif
+
 constexpr int PORT = 7777;
 static constexpr UINT TRAY_ICON_ID = 1;
 static constexpr UINT STATUS_TIMER_ID = 1;
@@ -189,6 +194,40 @@ static void ClipboardThread()
         closesocket(listenToClose);
 }
 
+// Returns the scan code Windows reports for this virtual key's physical key,
+// with 0xE0 in the high byte when Windows flags the key as extended.
+static UINT ScanCodeFromVirtualKey(UINT vkCode)
+{
+    switch (vkCode)
+    {
+    // MapVirtualKey returns the numpad scan code for these keys and drops the
+    // E0 prefix that the dedicated keys send.
+    case VK_INSERT:
+    case VK_DELETE:
+    case VK_HOME:
+    case VK_END:
+    case VK_PRIOR:
+    case VK_NEXT:
+    case VK_LEFT:
+    case VK_UP:
+    case VK_RIGHT:
+    case VK_DOWN:
+        return 0xE000 | MapVirtualKeyW(vkCode, MAPVK_VK_TO_VSC);
+    // In keyboard messages Windows reports NumLock as 0x45 with the extended
+    // flag and Pause as 0x45 without it. MapVirtualKey returns 0x45 for
+    // NumLock and E1 1D for Pause.
+    case VK_NUMLOCK:
+        return 0xE045;
+    case VK_PAUSE:
+        return 0x45;
+    // MapVirtualKey returns the SysRq scan code (0x54) for PrintScreen.
+    case VK_SNAPSHOT:
+        return 0xE037;
+    default:
+        return MapVirtualKeyW(vkCode, MAPVK_VK_TO_VSC_EX);
+    }
+}
+
 static bool ProcessPacket(const KeyboardPacket &packet)
 {
     if (packet.magic != KEYBOARD_PACKET_MAGIC ||
@@ -196,10 +235,15 @@ static bool ProcessPacket(const KeyboardPacket &packet)
         packet.vkCode == 0 || packet.down > 1)
         return false;
 
+    const UINT scanCode = ScanCodeFromVirtualKey(packet.vkCode);
+
     INPUT input{};
     input.type = INPUT_KEYBOARD;
     input.ki.wVk = packet.vkCode;
+    input.ki.wScan = static_cast<WORD>(scanCode & 0xFF);
     input.ki.dwFlags = packet.down ? 0 : KEYEVENTF_KEYUP;
+    if ((scanCode & 0xFF00) == 0xE000)
+        input.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
     SendInput(1, &input, sizeof(input));
     return true;
 }
